@@ -1,0 +1,55 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Episode {
+  id          String   @id @default(cuid())
+  title       String
+  topic       String
+  style       String
+  language    String   @default("sl")
+  status      String   @default("script_ready")
+  hostsJson   String   @default("[]")
+  // Vir epizode (raziskava konkurence: NotebookLM/Jellypod/Wondercraft "sources")
+  sourceType  String   @default("topic") // topic | url | text
+  sourceUrl   String?
+  sourceText  String?
+  // Nadzor generiranja
+  length      String   @default("medium") // short | medium | long
+  focus       String? // dodatna navodila uporabnika (NotebookLM "custom prompt")
+  // Show notes (Podsqueeze/Jellypod): povzetek + poudarki
+  summaryJson String?
+  // AI ovitek epizode (Jellypod cover art)
+  coverPath   String?
+  // Statistika predvajanja (Jellypod/Spotify za ustvarjalce): igre = vsaj 30 s poslušanja
+  playCount    Int       @default(0)
+  lastPlayedAt DateTime?
+  progressMs   Int       @default(0)
+  createdAt    DateTime  @default(now())
+  lines        Line[]
+}
+
+model Line {
+  id        String   @id @default(cuid())
+  episodeId String
+  episode   Episode  @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  idx       Int
+  speaker   String
+  voice     String
+  speed     Float    @default(1.0)
+  emotion   String?
+  text      String
+  chapter   String? // naslov poglavja, če vrstica odpira novo poglavje
+  audioPath String?
+  createdAt DateTime @default(now())
+
+  @@index([episodeId, idx])
+}

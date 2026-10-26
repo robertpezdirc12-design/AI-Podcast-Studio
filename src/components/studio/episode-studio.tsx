@@ -1,0 +1,2128 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  AudioLines,
+  BookOpen,
+  Captions,
+  Check,
+  ChevronDown,
+  Clapperboard,
+  ClipboardPaste,
+  Copy,
+  Download,
+  FileText,
+  ImagePlus,
+  Keyboard,
+  Link2,
+  ListOrdered,
+  Loader2,
+  Mic,
+  Music,
+  Pencil,
+  Quote,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Share2,
+  TriangleAlert,
+  X,
+  type LucideIcon,
+} from 'lucide-react';
+import { toast } from 'sonner';
+
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Progress } from '@/components/ui/progress';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  askHosts,
+  downloadChapterClip,
+  downloadChapterShort,
+  downloadEpisodeChapters,
+  downloadEpisodeMp3,
+  downloadEpisodeSrt,
+  downloadEpisodeTranscript,
+  downloadEpisodeVideo,
+  downloadLineClip,
+  generateCover,
+  generateEpisodeAudio,
+  generateLineAudio,
+  loadLocalPosition,
+  saveLocalPosition,
+  updateEpisodeProgress,
+  updateLineText,
+} from '@/lib/podcast-client';
+import {
+  LANGUAGE_LABELS,
+  SOURCE_TYPE_LABELS,
+  STYLE_LABELS,
+  VOICES,
+  hostColor,
+  type Episode,
+  type Line,
+} from '@/lib/podcast-types';
+import { cn } from '@/lib/utils';
+import { activatePan, setElementPan } from '@/lib/audio-pan';
+import { panForSpeaker, speakerPanMapFor } from '@/lib/podcast-pan';
+import { AskHostsCard } from './ask-hosts-card';
+import { ChaptersRow, type ChapterChip } from './chapters-row';
+import { Equalizer } from './equalizer';
+import { PlayerBar, type SleepTimerChoice } from './player-bar';
+import { downloadQuoteCard } from './quote-card';
+import { dimIfNoMatch, foldText, HighlightedText, ScenarioSearchBar } from './scenario-search';
+import { ShowNotesPanel } from './show-notes-panel';
+import { ShortcutsDialog } from './shortcuts-dialog';
+
+interface EpisodeStudioProps {
+  episode: Episode;
+  playing: boolean;
+  autoPlay?: boolean;
+  onPlayingChange: (playing: boolean) => void;
+}
+
+function nextAudioIndex(lines: Line[], from: number): number | null {
+  for (let i = Math.max(0, from); i < lines.length; i += 1) {
+    if (lines[i].audioPath) return i;
+  }
+  return null;
+}
+
+function prevAudioIndex(lines: Line[], before: number): number | null {
+  for (let i = Math.min(lines.length - 1, before); i >= 0; i -= 1) {
+    if (lines[i].audioPath) return i;
+  }
+  return null;
+}
+
+/**
+ * Strežnik regenerirani TTS zapiše v ISTO datoteko (`{lineId}.wav`), ki jo
+ * brskalnik kešira z `immutable`. Zato po urejanju vrstice dodamo `?v=n`,
+ * da audio element prav zagotovo naloži svež zvok.
+ */
+function withCacheBust(audioPath: string, version: number): string {
+  return `${audioPath}${audioPath.includes('?') ? '&' : '?'}v=${version}`;
+}
+
+/** Vrsta izvoza, ki trenutno teče (null = ni aktivnega izvoza). */
+type ExportKind = 'mp3j' | 'mp3s' | 'video' | 'srt' | 'txt' | 'chapters';
+
+/** Vrsta izrezka za deljenje na vrstici (MP3 govor, MP4 audiogram, poglavje). */
+type ClipKind = 'mp3' | 'video' | 'chapter' | 'chapterVideo';
+
+/** Ura za spanje: odštevalnik v ms, pavza na koncu epizode ali null (izklopljena). */
+type SleepTimerState =
+  | { mode: 'ms'; deadline: number; totalMs: number }
+  | { mode: 'episode' }
+  | null;
+
+const EXPORT_ITEMS: {
+  kind: ExportKind;
+  label: string;
+  hint?: string;
+  Icon: LucideIcon;
+  needsAudio: boolean;
+}[] = [
+  { kind: 'mp3j', label: 'MP3 — z uvodno melodijo', Icon: Music, needsAudio: true },
+  { kind: 'mp3s', label: 'MP3 — samo govor', Icon: Mic, needsAudio: true },
+  {
+    kind: 'video',
+    label: 'Video MP4 (audiogram)',
+    hint: 'Generiranje traja 5–45 s',
+    Icon: Clapperboard,
+    needsAudio: true,
+  },
+  { kind: 'srt', label: 'Podnapisi (.srt)', Icon: Captions, needsAudio: true },
+  { kind: 'txt', label: 'Transkript (.txt)', Icon: FileText, needsAudio: false },
+  { kind: 'chapters', label: 'Poglavja — YouTube (.txt)', Icon: ListOrdered, needsAudio: false },
+];
+
+/** Milisekunde → m:ss ali h:mm:ss (npr. toast „Nadaljuj od 0:42“). */
+function formatMs(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = String(Math.floor((total % 3600) / 60)).padStart(h > 0 ? 2 : 1, '0');
+  const s = String(total % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
+
+/*
+ * GREJE HTTP predpomnilnik za zvočne datoteke (vrstice + pavze). Audio
+ * elementi z preload='auto' brskalnik rada obreže na metadata — ekspliciten
+ * fetch() pa prisili celotni prenos (odgovori so immutable) → menjave vrstic,
+ * prekrivni vzkliki (ghost) in room-tone pavze zaženejo BREZ mrežne latence
+ * (izmerjeno: ghost zagon 120 ms → ~10 ms).
+ */
+const audioPrefetchCache = new Set<string>();
+function prefetchAudio(src: string): void {
+  if (audioPrefetchCache.has(src)) return;
+  audioPrefetchCache.add(src);
+  void fetch(src, { cache: 'force-cache' }).catch(() => {
+    audioPrefetchCache.delete(src); // neuspeh → poskus ob naslednji uporabi
+  });
+}
+
+/** Skupni čas vseh zvočnih vrstic pred `index` (v ms). */
+function cumulativeBeforeMs(
+  lines: Line[],
+  durations: Record<string, number>,
+  index: number,
+): number {
+  let before = 0;
+  for (let i = 0; i < index; i += 1) {
+    // Pavze (preDelayMs) se prištevajo — statistika/pozicija se ujemata z izvoženim MP3
+    if (lines[i].audioPath)
+      before += (durations[lines[i].id] ?? 0) * 1000 + (lines[i].preDelayMs ?? 0);
+  }
+  return before;
+}
+
+/**
+ * Studio za eno epizodo: glava (ovitek, vir, podnapisi), poglavja, show notes,
+ * karaoke seznam z urejanjem vrstic, vprašanje voditelju in lepljivi predvajalnik.
+ * Vsa predvajalna logika živi tukaj, stanje `playing` pa je dvignjeno v page.tsx
+ * (nalepka ON AIR v glavi).
+ */
+export function EpisodeStudio({
+  episode,
+  playing,
+  autoPlay = false,
+  onPlayingChange,
+}: EpisodeStudioProps) {
+  const [lines, setLines] = useState<Line[]>(episode.lines);
+  const [lineErrors, setLineErrors] = useState<string[]>([]);
+  const [retryingIds, setRetryingIds] = useState<string[]>([]);
+  const [durations, setDurations] = useState<Record<string, number>>({});
+  const [currentIndex, setCurrentIndex] = useState<number | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [rate, setRate] = useState(1);
+  const [muted, setMuted] = useState(false);
+  const [exporting, setExporting] = useState<ExportKind | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [clipBusy, setClipBusy] = useState<{ lineId: string; kind: ClipKind } | null>(null);
+  const [shareMenuLineId, setShareMenuLineId] = useState<string | null>(null);
+  const [sleepTimer, setSleepTimer] = useState<SleepTimerState>(null);
+  const [sleepRemainingMs, setSleepRemainingMs] = useState<number | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [coverPath, setCoverPath] = useState<string | null>(episode.coverPath);
+  const [coverPending, setCoverPending] = useState(false);
+  const [coverVersion, setCoverVersion] = useState(0);
+
+  // Urejanje vrstice
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
+  const [savingLineId, setSavingLineId] = useState<string | null>(null);
+
+  // Iskanje po scenariju (Apple Podcasts transkript-search stil) + pomoč za bližnjice
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchActiveIdx, setSearchActiveIdx] = useState(0);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const linesRef = useRef(lines);
+  linesRef.current = lines;
+  /*
+   * Stereo umestitev gostiteljev (Task 28) — isti ±0,25 pan kot v MP3 izvozu
+   * (skupni vir resnice: podcast-pan.ts). Ref zato, da startGap/startGhost
+   * dostopata do svežega zemljevida brez spreminjanja svojih odvisnosti.
+   */
+  const panBySpeaker = useMemo(() => speakerPanMapFor(lines), [lines]);
+  const panBySpeakerRef = useRef(panBySpeaker);
+  panBySpeakerRef.current = panBySpeaker;
+  const currentIndexRef = useRef<number | null>(null);
+  currentIndexRef.current = currentIndex;
+  const rateRef = useRef(rate);
+  rateRef.current = rate;
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const durationsRef = useRef(durations);
+  durationsRef.current = durations;
+  const episodeIdRef = useRef(episode.id);
+  const sleepTimerRef = useRef<SleepTimerState>(null);
+  sleepTimerRef.current = sleepTimer;
+  const finishEpisodeRef = useRef<() => void>(() => {});
+  const exportingRef = useRef<ExportKind | null>(null);
+  const clipBusyRef = useRef<{ lineId: string; kind: ClipKind } | null>(null);
+  const sessionPlayedRef = useRef(0); // poslušano ms v tej seji (igra = ≥ 30 s)
+  const countedPlayRef = useRef(false);
+  const lastProgressPostRef = useRef(0); // debelo vsak ~5 s
+  const lastTickAtRef = useRef(0); // stenska ura zadnjega timeupdate med predvajanjem
+  const lastElapsedMsRef = useRef(0); // zadnja znana pozicija (za flush ob odhodu)
+  const finishingRef = useRef(false); // konec epizode v teku — ne pošiljaj več progressa
+  const pendingSeekRef = useRef<{ index: number; offsetSec: number; play: boolean } | null>(null);
+  const resumeDoneRef = useRef(false);
+  const lineErrorsRef = useRef<string[]>([]);
+  const rowRefs = useRef<(HTMLLIElement | null)[]>([]);
+  const probesRef = useRef<HTMLAudioElement[]>([]);
+  const triedDurationIdsRef = useRef<Set<string>>(new Set());
+  const autoPlayDoneRef = useRef(false);
+  const audioVersionsRef = useRef<Map<string, number>>(new Map());
+  // Kontekstne pavze med vrsticami (room tone) — enaka akustika kot MP3 izvoz
+  const gapAudioRef = useRef<HTMLAudioElement | null>(null);
+  const gapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingGapNextRef = useRef<number | null>(null);
+  const ghostTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ghostRafRef = useRef<number | null>(null);
+  const ghostActiveRef = useRef(false);
+  /*
+   * JINGLE UVOD/IZHOD (Task 30) — isti knjižni zvočni znaki kot v MP3 izvozu.
+   * Uvod: pre-roll pred 1. vrstico ob zagonu od začetka (NI del časovne osi
+   * vrstic — napredek ostane 0). Izhod: po zadnji vrstici. Ločen element (ne
+   * gapAudioRef), da ne meša z kalibriranim ghost/pavze mehanizmom.
+   */
+  const introAudioRef = useRef<HTMLAudioElement | null>(null);
+  const introTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const introPhaseRef = useRef<'intro' | 'outro' | null>(null);
+  const introDoneRef = useRef<() => void>(() => {});
+  const [jinglePhase, setJinglePhase] = useState<'intro' | 'outro' | null>(null);
+
+  /** Ustavi rAF opazovalca prekrivanja (ob pavzi/prekinitvi/meni vrstice). */
+  const stopGhostWatch = useCallback(() => {
+    if (ghostRafRef.current !== null) {
+      cancelAnimationFrame(ghostRafRef.current);
+      ghostRafRef.current = null;
+    }
+  }, []);
+
+  const addLineError = useCallback((lineId: string) => {
+    if (lineErrorsRef.current.includes(lineId)) return;
+    lineErrorsRef.current = [...lineErrorsRef.current, lineId];
+    setLineErrors(lineErrorsRef.current);
+  }, []);
+
+  const removeLineError = useCallback((lineId: string) => {
+    if (!lineErrorsRef.current.includes(lineId)) return;
+    lineErrorsRef.current = lineErrorsRef.current.filter((id) => id !== lineId);
+    setLineErrors(lineErrorsRef.current);
+  }, []);
+
+  // ── Kontekstne pavze (room tone) med vrsticami — ustrezajo MP3 izvozu ──
+  const clearGapTimers = useCallback(() => {
+    stopGhostWatch();
+    if (gapTimerRef.current) {
+      clearTimeout(gapTimerRef.current);
+      gapTimerRef.current = null;
+    }
+    if (ghostTimerRef.current) {
+      clearTimeout(ghostTimerRef.current);
+      ghostTimerRef.current = null;
+    }
+    const gapAudio = gapAudioRef.current;
+    if (gapAudio) {
+      gapAudio.onended = null;
+      gapAudio.onerror = null;
+      gapAudio.ontimeupdate = null;
+      gapAudio.pause();
+      try {
+        gapAudio.currentTime = 0;
+      } catch {
+        // ni kritično
+      }
+    }
+    // Jingle (uvod/izhod) — isti kanal čiščenja: vsak skok/pavza ga prekliče
+    if (introTimerRef.current) {
+      clearTimeout(introTimerRef.current);
+      introTimerRef.current = null;
+    }
+    const intro = introAudioRef.current;
+    if (intro) {
+      intro.onended = null;
+      intro.onerror = null;
+      intro.pause();
+    }
+    if (introPhaseRef.current) {
+      introPhaseRef.current = null;
+      setJinglePhase(null);
+    }
+    ghostActiveRef.current = false;
+  }, [stopGhostWatch]);
+
+  /** Prekliči tekočo pavzo (klik/pauza/skok uporabnika — ostane na trenutni vrstici). */
+  const cancelGap = useCallback(() => {
+    pendingGapNextRef.current = null;
+    clearGapTimers();
+  }, [clearGapTimers]);
+
+  // ── Jingle uvod/izhod (Task 30) — poravnava aplikacije z MP3 izvozom ──
+  /**
+   * Predvaja uvodno/zaključno melodijo (isti ffmpeg sting kot v izvozu).
+   * Uvod: pre-roll pred 1. vrstico ob zagonu od začetka (napredek ostane 0 —
+   * melodija NI del časovne osi vrstic). Izhod: po zadnji vrstici.
+   * Pauza med melodijo jo zamrzne (nadaljuj = doigra od mesta pavze); skok /
+   * klik na vrstico prek cancelGap–clearGapTimers melodijo prekličejo.
+   * Napaka/zavrnitev play() → takoj naprej (fallback: brez melodije).
+   */
+  const startJingle = useCallback(
+    (kind: 'intro' | 'outro', onDone: () => void) => {
+      clearGapTimers();
+      const src =
+        kind === 'intro' ? '/api/audio/jingle_intro.wav' : '/api/audio/jingle_outro.wav';
+      prefetchAudio(src);
+      let el = introAudioRef.current;
+      if (!el) {
+        el = new Audio();
+        el.preload = 'auto';
+        introAudioRef.current = el;
+      }
+      el.src = src;
+      const done = () => {
+        if (introTimerRef.current) {
+          clearTimeout(introTimerRef.current);
+          introTimerRef.current = null;
+        }
+        el.onended = null;
+        el.onerror = null;
+        introPhaseRef.current = null;
+        setJinglePhase(null);
+        onDone();
+      };
+      introDoneRef.current = done;
+      el.onended = done;
+      el.onerror = done;
+      introPhaseRef.current = kind;
+      setJinglePhase(kind);
+      // Varnostna mreža (glavni sprožilec je onended; melodiji sta 2,2 / 3,0 s)
+      introTimerRef.current = setTimeout(done, 9000);
+      // Melodija sredinsko (v izvozu dual-mono) + tekoč kontekst za pan
+      setElementPan(el, 0);
+      activatePan();
+      void el.play().catch(done);
+    },
+    [clearGapTimers],
+  );
+
+  /** Zaključi pavzo takoj in preklopi na čakajočo vrstico. */
+  const finishGap = useCallback(() => {
+    const next = pendingGapNextRef.current;
+    if (next === null) return;
+    /*
+     * OPOMBA: glavni zvok je tu VEDNO `paused` (vrstica se je naravno končala →
+     * `ended`). Prejšnje preverjanje `audio.paused` je zato odpovedalo VSE
+     * pozitivne pavze → predvajanje je obtičilo ob vsaki menjavi vrstic.
+     * Pauza uporabnika med pavzo je že pokrita: `togglePlay`/`handlePause`
+     * pokliče `cancelGap` → `pendingGapNextRef` je prazn → zgornji early-return.
+     * Zamrznjen prekrivni vzklik pa ne kliče `finishGap` (njegovi sprožilci so
+     * počiščeni; nadaljevanje gre prek `togglePlay` → `handleGhostEnded`).
+     */
+    pendingGapNextRef.current = null;
+    clearGapTimers();
+    setCurrentIndex(next);
+  }, [clearGapTimers]);
+
+  /**
+   * Pavza pred naslednjo vrstico: predvaja `gap_<s>.wav` (isti room tone kot
+   * vrstice in izvoz — glej ensureGapFile), nato preklopi. Brez datoteke (404)
+   * → tiha pavza z istim trajanjem. Menjava govorca/poglavja v appu zveni
+   * NARAVNO, ne kot takojšnje stiskanje vrstic skupaj.
+   */
+  const startGap = useCallback(
+    (nextIndex: number, gapMs: number) => {
+      cancelGap();
+      if (gapMs < 30) {
+        setCurrentIndex(nextIndex);
+        return;
+      }
+      pendingGapNextRef.current = nextIndex;
+      const gapSrc = `/api/audio/gap_${(gapMs / 1000).toFixed(2)}.wav`;
+      prefetchAudio(gapSrc); // obrambno — gretje, če še ni bilo prednalagano
+      let gapAudio = gapAudioRef.current;
+      if (!gapAudio) {
+        gapAudio = new Audio();
+        gapAudio.preload = 'auto';
+        gapAudioRef.current = gapAudio;
+      }
+      gapAudio.src = gapSrc;
+      gapAudio.onended = finishGap;
+      gapAudio.onerror = finishGap; // manjkajoča datoteka → takoj naprej
+      gapTimerRef.current = setTimeout(finishGap, gapMs + 250); // varnostna mreža
+      // Room tone ostane SREDINSKO (v izvozu je bed dual-mono) + obnovi kontekst
+      setElementPan(gapAudio, 0);
+      activatePan();
+      void gapAudio.play().catch(() => { /* room tone ni kritičen */ });
+    },
+    [cancelGap, finishGap],
+  );
+
+  /** Konec prekrivnega vzklika (drugi kanal) → običajna kontekstna pavza naprej. */
+  const handleGhostEnded = useCallback(() => {
+    const next = pendingGapNextRef.current;
+    pendingGapNextRef.current = null;
+    clearGapTimers(); // počisti tudi ghostActiveRef
+    if (next === null) return;
+    const after = nextAudioIndex(linesRef.current, next + 1);
+    if (after !== null) {
+      startGap(after, linesRef.current[after]?.preDelayMs ?? 0);
+    } else {
+      finishEpisodeRef.current();
+    }
+  }, [clearGapTimers, startGap]);
+
+  /**
+   * Vnaprejšnja priprava prekrivnega vzklika: isti element (`gapAudioRef`) dobi
+   * PRAVI `src` ŽE OB RAZPOREDITVI (tudi vsebina je v predpomnilniku prek
+   * prefetchAudio) → ob sprožitvi je `play()` takojšen (pripravljen dekoder).
+   * Izmerjeno: nastavljanje `src` ob sprožitvi doda 120–240 ms latence →
+   * slišno prekrivanje se skrči s 180 ms na ~50 ms.
+   */
+  const prepareGhost = useCallback((nextIdx: number) => {
+    const line = linesRef.current[nextIdx];
+    if (!line?.audioPath) return;
+    prefetchAudio(line.audioPath);
+    let ghost = gapAudioRef.current;
+    if (!ghost) {
+      ghost = new Audio();
+      ghost.preload = 'auto';
+      gapAudioRef.current = ghost;
+    }
+    const want = new URL(line.audioPath, window.location.href).href;
+    if (ghost.paused && ghost.src !== want) {
+      ghost.src = line.audioPath;
+      ghost.preload = 'auto';
+      ghost.load();
+    }
+  }, []);
+
+  /**
+   * PREKRIVNI VZKLIK (backchannel): naslednjo vrstico predvaja DRUGI kanal
+   * (ghost), ki se začne |overlapMs| PRED koncem trenutne — kot v resničnem
+   * pogovoru („Resno?!“ nad zadnjim zlogom). Glavni zvok neopazno doigra,
+   * karaoke pa se preklopi TAKOJ (vzklik je dramaturško aktiven).
+   */
+  const startGhost = useCallback(
+    (nextIndex: number, overlapMs: number) => {
+      if (pendingGapNextRef.current !== null || ghostActiveRef.current) return;
+      const line = linesRef.current[nextIndex];
+      if (!line?.audioPath) return;
+      prefetchAudio(line.audioPath); // obrambno — vzklik mora začeti TAKOJ
+      ghostActiveRef.current = true;
+      pendingGapNextRef.current = nextIndex;
+      let ghost = gapAudioRef.current;
+      if (!ghost) {
+        ghost = new Audio();
+        ghost.preload = 'auto';
+        gapAudioRef.current = ghost;
+      }
+      // Če je element že pripravljen (prepareGhost → isti src, naložen), NE
+      // ponastavljaj src — to bi sprožilo ponoven load (120–240 ms latence).
+      const want = new URL(line.audioPath, window.location.href).href;
+      if (ghost.src !== want) {
+        ghost.src = line.audioPath;
+      } else {
+        try {
+          ghost.currentTime = 0; // prejšnji doigran vzklik → nazaj na začetek
+        } catch {
+          // ni kritično
+        }
+      }
+      ghost.playbackRate = rateRef.current;
+      ghost.ontimeupdate = () => setCurrentTime(ghost.currentTime);
+      ghost.onended = handleGhostEnded;
+      ghost.onerror = handleGhostEnded; // napaka → naprej, kot da je doigral
+      // Vzklik pripada svojemu govorcu → njegov pan (enako kot v izvozu)
+      setElementPan(ghost, panForSpeaker(panBySpeakerRef.current, line.speaker));
+      activatePan();
+      void ghost.play().catch(() => { /* vzklik izpusti — tok teče normalno */ });
+      setCurrentIndex(nextIndex);
+    },
+    [handleGhostEnded, prepareGhost],
+  );
+
+  /**
+   * Natančen sprožilec prekrivanja na AVDIO uri: vsak frame (rAF, ~60 Hz)
+   * primerja `audio.currentTime` z `audio.duration + overlap`. Brskalnikov
+   * `duration` je natančno dekodirano trajanje datoteke, zato zagon NI odvisen
+   * od stenskega zamika med razporeditvijo in dejanskim začetkom zvoka (latenca
+   * `play()`: fetch/dekoda do ~300 ms) — prekrivanje zadene ±1 slišni okvir.
+   * rAF v skritem zavihku miruje → pokrijeta ga avdio-urejen wall-clock timer
+   * (`scheduleGhostFor`) in rezervni timeupdate sprožilec.
+   */
+  const armGhostWatch = useCallback(() => {
+    stopGhostWatch();
+    const tick = () => {
+      ghostRafRef.current = null;
+      const audio = audioRef.current;
+      if (!audio || audio.paused || ghostActiveRef.current || pendingGapNextRef.current !== null) {
+        return; // pavza/vzklik teče/čaka pavza → opazovalec ni potreben
+      }
+      const idx = currentIndexRef.current;
+      if (idx === null) return;
+      const nextIdx = nextAudioIndex(linesRef.current, idx + 1);
+      if (nextIdx === null) return;
+      const gapMs = linesRef.current[nextIdx]?.preDelayMs ?? 0;
+      if (gapMs >= 0) return; // pozitivna pavza → handleEnded/startGap
+      prepareGhost(nextIdx); // vzklik naložen vnaprej → play() takojšen
+      const dur = audio.duration;
+      if (!Number.isFinite(dur) || dur <= 0) {
+        ghostRafRef.current = requestAnimationFrame(tick); // metadata še ni pripravljena
+        return;
+      }
+      if (audio.currentTime >= dur + gapMs / 1000) {
+        startGhost(nextIdx, -gapMs);
+        return;
+      }
+      ghostRafRef.current = requestAnimationFrame(tick);
+    };
+    ghostRafRef.current = requestAnimationFrame(tick);
+  }, [startGhost, stopGhostWatch]);
+
+  /** Razporedi prekrivni vzklik za vrstico PO `idx` (če ima negativno pavzo). */
+  const scheduleGhostFor = useCallback(
+    (idx: number) => {
+      if (ghostTimerRef.current) {
+        clearTimeout(ghostTimerRef.current);
+        ghostTimerRef.current = null;
+      }
+      const nextIdx = nextAudioIndex(linesRef.current, idx + 1);
+      if (nextIdx === null) return;
+      const gapMs = linesRef.current[nextIdx]?.preDelayMs ?? 0;
+      if (gapMs >= 0) return;
+      prepareGhost(nextIdx); // vzklik naložen vnaprej → play() takojšen
+      const cur = linesRef.current[idx];
+      const durSec = cur ? (durationsRef.current[cur.id] ?? 0) : 0;
+      if (durSec <= 0) return; // trajanje ni znano — poskrbi rezervni timeupdate sprožilec
+      /*
+       * Wall-clock varnostna mreža (pokrije skrit zavihek, kjer rAF miruje).
+       * Sidro NI trenutev razporeditve — `play()` ima latenca fetch/dekoda do
+       * ~300 ms, zaradi česar je vzklik streljal PREZGODAJ (izmerjeno 426 ms
+       * prekrivanja namesto nameravnih 180 ms). Ob zagonu preveri DEJANSKI
+       * položaj na avdio uri in se po potrebi znova razporedi — prekrivanje
+       * zadenemo glede na zvok, ne glede na mrežne/dekodirne zamike.
+       */
+      const fire = () => {
+        ghostTimerRef.current = null;
+        const audio = audioRef.current;
+        if (!audio || audio.paused) return; // pavzirano → handlePlay ob nadaljevanju
+        const dur = audio.duration;
+        if (Number.isFinite(dur) && dur > 0) {
+          const remainMs = Math.round(((dur + gapMs / 1000 - audio.currentTime) * 1000) / rateRef.current);
+          if (remainMs > 0) {
+            ghostTimerRef.current = setTimeout(fire, remainMs); // ponovno sidraj na avdio uro
+            return;
+          }
+        }
+        startGhost(nextIdx, -gapMs);
+      };
+      ghostTimerRef.current = setTimeout(
+        fire,
+        Math.max(0, Math.round(((durSec + gapMs / 1000) * 1000) / rateRef.current)),
+      );
+    },
+    [startGhost, prepareGhost],
+  );
+
+  // En sam HTMLAudioElement za predvajanje cele epizode.
+  useEffect(() => {
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audioRef.current = audio;
+    const handlePlay = () => {
+      activatePan(); // AudioContext teče za vsakim predvajanjem (aktivacija strani)
+      finishingRef.current = false; // novo predvajanje — konec epizode ni več v teku
+      lastTickAtRef.current = Date.now();
+      armGhostWatch(); // natančen sprožilec prekrivanja na avdio uri (tudi po pavzi/iskanju)
+      onPlayingChange(true);
+    };
+    const handlePause = () => {
+      // Naravni konec vrstice, prekrivni vzklik še teče → predvajanje NI končano
+      // (vzklik doigra na drugem kanalu); togglePlay eksplicitno nastavi stanje
+      if (ghostActiveRef.current && audio.ended) return;
+      onPlayingChange(false);
+      // Takojšnja objava napredka ob pavzi (tudi ob preklopu vrstice).
+      if (finishingRef.current) {
+        finishingRef.current = false; // pozicija je že ponastavljena na 0
+        return;
+      }
+      const idx = currentIndexRef.current;
+      if (idx === null) return;
+      const elapsedMs = Math.max(
+        0,
+        Math.round(
+          cumulativeBeforeMs(linesRef.current, durationsRef.current, idx) + audio.currentTime * 1000,
+        ),
+      );
+      lastElapsedMsRef.current = elapsedMs;
+      saveLocalPosition(episodeIdRef.current, elapsedMs);
+      void updateEpisodeProgress(episodeIdRef.current, elapsedMs, false);
+    };
+    const handleTime = () => {
+      const t = audio.currentTime;
+      setCurrentTime(t);
+      if (audio.paused) return;
+      // Rezervni sprožilec prekrivnega vzklika (če razporejeni časovnik zamudi
+      // — npr. zaradi spremembe hitrosti predvajanja)
+      if (!ghostActiveRef.current && pendingGapNextRef.current === null && audio.duration > 0) {
+        const nIdx = nextAudioIndex(linesRef.current, (currentIndexRef.current ?? 0) + 1);
+        const nGap = nIdx !== null ? (linesRef.current[nIdx]?.preDelayMs ?? 0) : 0;
+        if (nIdx !== null && nGap < 0 && t >= audio.duration + nGap / 1000) {
+          startGhost(nIdx, -nGap);
+        }
+      }
+      const idx = currentIndexRef.current;
+      if (idx === null) return;
+      const elapsedMs = Math.max(
+        0,
+        Math.round(cumulativeBeforeMs(linesRef.current, durationsRef.current, idx) + t * 1000),
+      );
+      lastElapsedMsRef.current = elapsedMs;
+      const id = episodeIdRef.current;
+      saveLocalPosition(id, elapsedMs); // nadaljuj od mesta ustavitve
+      const now = Date.now();
+      const last = lastTickAtRef.current;
+      lastTickAtRef.current = now;
+      if (last > 0) {
+        sessionPlayedRef.current += Math.min(now - last, 2000); // realni dt, odrezani odskoki
+      }
+      if (!countedPlayRef.current && sessionPlayedRef.current >= 30000) {
+        countedPlayRef.current = true; // Spotify definicija igre: ≥ 30 s poslušanja
+        void updateEpisodeProgress(id, elapsedMs, true);
+      }
+      if (now - lastProgressPostRef.current >= 5000) {
+        lastProgressPostRef.current = now;
+        void updateEpisodeProgress(id, elapsedMs, false);
+      }
+    };
+    const handleEnded = () => {
+      if (ghostActiveRef.current) return; // vzklik še predvaja drugi kanal
+      const current = currentIndexRef.current;
+      if (current === null) return;
+      const next = nextAudioIndex(linesRef.current, current + 1);
+      if (next !== null) {
+        const gapMs = linesRef.current[next]?.preDelayMs ?? 0;
+        if (gapMs < 0) {
+          // PREKRIVANJE: vzklik se začne pred koncem (zadnji/varni sprožilec)
+          startGhost(next, -gapMs);
+        } else {
+          // Kontekstna pavza (menjava govorca/poglavje + room tone) — kot v izvozu
+          startGap(next, gapMs);
+        }
+      } else {
+        finishEpisodeRef.current(); // konec epizode → ponastavi pozicijo/statistiko
+      }
+      // Na zadnji vrstici: `pause` dogodek je stanje `playing` že izklopil,
+      // currentTime ostane na koncu → prikazani čas = skupno trajanje.
+    };
+    audio.addEventListener('play', handlePlay);
+    audio.addEventListener('pause', handlePause);
+    audio.addEventListener('timeupdate', handleTime);
+    audio.addEventListener('ended', handleEnded);
+    return () => {
+      cancelGap();
+      audio.pause();
+      audio.removeEventListener('play', handlePlay);
+      audio.removeEventListener('pause', handlePause);
+      audio.removeEventListener('timeupdate', handleTime);
+      audio.removeEventListener('ended', handleEnded);
+      audio.src = '';
+      audioRef.current = null;
+    };
+  }, [onPlayingChange, cancelGap, startGap, startGhost, armGhostWatch]);
+
+  // Ko se spremeni trenutna vrstica (njen audioPath) → nastavi vir in predvajaj.
+  // Če čaka iskalni poskus („Nadaljuj od …“), najprej tiho poskoči na pozicijo.
+  const currentLine = currentIndex !== null ? (lines[currentIndex] ?? null) : null;
+  const currentAudioPath = currentLine?.audioPath ?? null;
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || currentIndex === null) return;
+    // Prekrivni vzklik predvaja to vrstico drugi kanal — glavnega zvoka ne tipkaj
+    if (ghostActiveRef.current) return;
+    cancelGap(); // počisti morebitne pavze/časovnike prejšnje tranzicije
+    const line = linesRef.current[currentIndex];
+    if (!line?.audioPath) return;
+    const seek =
+      pendingSeekRef.current !== null && pendingSeekRef.current.index === currentIndex
+        ? pendingSeekRef.current
+        : null;
+    if (seek) pendingSeekRef.current = null;
+    const expected = new URL(line.audioPath, window.location.href).href;
+    if (audio.src !== expected) {
+      audio.src = line.audioPath;
+      audio.load();
+    } else {
+      audio.currentTime = 0;
+    }
+    audio.playbackRate = rateRef.current;
+    audio.muted = mutedRef.current;
+    // Stereo umestitev govorca te vrstice — route/preklop ŠE PRED play() (element
+    // je pavziran → brez zvočnega preloma; kontekst teče po aktivaciji strani)
+    setElementPan(audio, panForSpeaker(panBySpeakerRef.current, line.speaker));
+    setCurrentTime(seek ? seek.offsetSec : 0);
+    if (seek) {
+      const applySeek = () => {
+        try {
+          audio.currentTime = seek.offsetSec;
+        } catch {
+          // iskanje ni uspelo — nadaljuj od začetka vrstice
+        }
+        setCurrentTime(seek.offsetSec);
+        if (seek.play) void audio.play().catch(() => {});
+      };
+      if (audio.readyState >= 1) {
+        applySeek();
+      } else {
+        audio.addEventListener('loadedmetadata', applySeek, { once: true });
+      }
+      return;
+    }
+    void audio.play().catch(() => {}); // zavrnitve avtopredvajanja so neškodljive
+    scheduleGhostFor(currentIndex);
+  }, [currentIndex, currentAudioPath, cancelGap, scheduleGhostFor]);
+
+  // Avtopredvajanje ob vstopu iz knjižnice (gumb Play na kartici).
+  useEffect(() => {
+    if (autoPlayDoneRef.current) return;
+    autoPlayDoneRef.current = true;
+    if (!autoPlay) return;
+    const first = nextAudioIndex(linesRef.current, 0);
+    if (first !== null) setCurrentIndex(first);
+  }, [autoPlay]);
+
+  // Trajanja posameznih vrstic: `durationMs` iz API-ja takoj, natenjeno ob loadedmetadata.
+  useEffect(() => {
+    for (const line of lines) {
+      if (!line.audioPath) continue;
+      prefetchAudio(line.audioPath); // celoten zvok v predpomnilniku → takojšnji zagoni
+      if (line.preDelayMs >= 30) {
+        // room-tone pavze, ki jih bo predvajalnik potreboval (distinct vrednosti)
+        prefetchAudio(`/api/audio/gap_${(line.preDelayMs / 1000).toFixed(2)}.wav`);
+      }
+      if (triedDurationIdsRef.current.has(line.id)) continue;
+      triedDurationIdsRef.current.add(line.id);
+      const probe = new Audio(line.audioPath);
+      // preload='auto' → celoten zvok že v predpomnilniku: menjave vrstic in
+      // prekrivni vzkliki (ghost.play()) zaženejo BREZ mrežne latence.
+      probe.preload = 'auto';
+      probe.addEventListener('loadedmetadata', () => {
+        if (Number.isFinite(probe.duration) && probe.duration > 0) {
+          setDurations((prev) => ({ ...prev, [line.id]: probe.duration }));
+        }
+      });
+      probesRef.current.push(probe);
+    }
+  }, [lines]);
+
+  // Vrsta za generiranje zvoka (vzporednost 2), preklic ob odhodu iz studia.
+  useEffect(() => {
+    if (!episode.lines.some((line) => line.audioPath === null)) return;
+    const cancel = generateEpisodeAudio(
+      episode,
+      (line, durationMs) => {
+        setLines((prev) =>
+          prev.map((item) => (item.id === line.id ? { ...item, audioPath: line.audioPath } : item)),
+        );
+        if (durationMs && durationMs > 0) {
+          setDurations((prev) => ({ ...prev, [line.id]: durationMs / 1000 }));
+        }
+        removeLineError(line.id);
+      },
+      () => {
+        if (lineErrorsRef.current.length === 0) {
+          toast.success('Epizoda je pripravljena! 🎧');
+        } else {
+          toast.error('Nekatere vrstice niso uspele. Klikni ikono za ponovni poskus.');
+        }
+      },
+      () => toast.error('Generiranje glasov ni uspelo. Poskusi znova.'),
+      addLineError,
+    );
+    return cancel;
+  }, [episode, addLineError, removeLineError]);
+
+  // Avtomatski pomik aktivne vrstice v vidno polje.
+  useEffect(() => {
+    if (currentIndex === null) return;
+    rowRefs.current[currentIndex]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [currentIndex]);
+
+  const readyCount = useMemo(() => lines.filter((line) => line.audioPath).length, [lines]);
+  const totalCount = lines.length;
+  const pendingCount = totalCount - readyCount;
+  const generating = pendingCount > 0;
+
+  const totalDuration = useMemo(
+    () =>
+      lines.reduce(
+        (sum, line) =>
+          line.audioPath ? sum + (durations[line.id] ?? 0) + (line.preDelayMs ?? 0) / 1000 : sum,
+        0,
+      ),
+    [lines, durations],
+  );
+
+  const elapsed = useMemo(() => {
+    if (currentIndex === null) return 0;
+    let before = 0;
+    for (let i = 0; i < currentIndex; i += 1) {
+      before += lines[i].audioPath
+        ? (durations[lines[i].id] ?? 0) + (lines[i].preDelayMs ?? 0) / 1000
+        : 0;
+    }
+    return before + currentTime;
+  }, [currentIndex, currentTime, durations, lines]);
+
+  // Trajanja vseh zvočnih vrstic so znana (pogoj za tihi skok na shranjeno pozicijo).
+  const durationsReady = useMemo(
+    () => lines.every((line) => !line.audioPath || (durations[line.id] ?? 0) > 0),
+    [lines, durations],
+  );
+
+  // Ogrevanje predpomnilnika za jingle melodije (Task 30) — zagon brez latence
+  useEffect(() => {
+    prefetchAudio('/api/audio/jingle_intro.wav');
+    prefetchAudio('/api/audio/jingle_outro.wav');
+  }, [episode.id]);
+
+  // Nadaljuj od mesta ustavitve (localStorage, Apple/Spotify stil): tihi skok
+  // na pravo vrstico + offset, BREZ avtomatskega predvajanja (razen eksplicitnega
+  // Play iz knjižnice).
+  useEffect(() => {
+    if (resumeDoneRef.current) return;
+    if (!durationsReady || totalDuration <= 0) return;
+    /*
+     * RACE (Task 30): če uporabnik že posluša (uvodna melodija / vrstica),
+     * obnova NE SME ugrabiti predvajanja na shranjeno pozicijo — eksplicitni
+     * zagon od začetka porabi obnovo (Apple/Spotify stil: play pri 0 = od 0).
+     */
+    if (introPhaseRef.current !== null || currentIndexRef.current !== null) {
+      resumeDoneRef.current = true;
+      return;
+    }
+    resumeDoneRef.current = true;
+    const savedMs = loadLocalPosition(episode.id);
+    if (savedMs === null) return;
+    const savedSec = savedMs / 1000;
+    if (savedSec <= 10 || savedSec >= totalDuration - 8) return;
+    lastElapsedMsRef.current = savedMs; // tihi resume: flush ob odhodu ne sme resetirati na 0
+    let acc = 0; // začetek trenutne vrstice na časovnici (pavze lahko NEGATIVNE)
+    for (let i = 0; i < linesRef.current.length; i += 1) {
+      const line = linesRef.current[i];
+      if (!line.audioPath) continue;
+      const d = durationsRef.current[line.id] ?? 0;
+      const nextIdx = nextAudioIndex(linesRef.current, i + 1);
+      const nextGapSec =
+        nextIdx !== null ? (linesRef.current[nextIdx].preDelayMs ?? 0) / 1000 : 0;
+      const nextStart = acc + d + nextGapSec;
+      if (savedSec < nextStart) {
+        const offsetSec = Math.min(Math.max(0, savedSec - acc), d);
+        if (i === currentIndexRef.current) {
+          // ista vrstica — iskalcni poskus neposredno na audio element
+          const audio = audioRef.current;
+          const applySeek = () => {
+            if (!audio) return;
+            try {
+              audio.currentTime = offsetSec;
+            } catch {
+              // iskanje ni uspelo — nadaljuj od začetka vrstice
+            }
+            setCurrentTime(offsetSec);
+            if (autoPlay) void audio.play().catch(() => {});
+          };
+          if (audio && audio.readyState >= 1) {
+            applySeek();
+          } else if (audio) {
+            audio.addEventListener('loadedmetadata', applySeek, { once: true });
+          }
+        } else {
+          pendingSeekRef.current = { index: i, offsetSec, play: autoPlay };
+          setCurrentIndex(i);
+        }
+        toast.success(`Nadaljujem od ${formatMs(savedMs)}`);
+        return;
+      }
+      acc = nextStart;
+    }
+  }, [durationsReady, totalDuration, episode.id, autoPlay]);
+
+  // Poglavja: zaporedne vrstice z istim naslovom poglavja so en čip.
+  const chapters = useMemo<ChapterChip[]>(() => {
+    const result: ChapterChip[] = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const chapter = lines[i].chapter;
+      if (!chapter) continue;
+      const last = result[result.length - 1];
+      if (last && last.title === chapter) continue;
+      result.push({ title: chapter, index: i });
+    }
+    return result;
+  }, [lines]);
+
+  const hostIndexOf = useCallback(
+    (speaker: string) => {
+      const idx = episode.hosts.findIndex((host) => host.name === speaker);
+      return idx >= 0 ? idx : 0;
+    },
+    [episode.hosts],
+  );
+
+  const togglePlay = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (playing) {
+      // Jingle (uvod/izhod) teče → samo zamrzni melodijo (ob nadaljevanju doigra)
+      if (introPhaseRef.current && introAudioRef.current) {
+        introAudioRef.current.pause();
+        if (introTimerRef.current) {
+          clearTimeout(introTimerRef.current);
+          introTimerRef.current = null;
+        }
+        onPlayingChange(false);
+        return;
+      }
+      audio.pause(); // ended zvok ne sproži 'pause' dogodka → eksplicitno:
+      onPlayingChange(false);
+      const secondary = gapAudioRef.current;
+      if (ghostActiveRef.current && pendingGapNextRef.current !== null) {
+        // prekrivni vzklik: samo zamrzni (ob play nadaljuje od mesta pavze)
+        if (secondary && !secondary.paused) secondary.pause();
+        if (gapTimerRef.current) {
+          clearTimeout(gapTimerRef.current);
+          gapTimerRef.current = null;
+        }
+      } else {
+        cancelGap(); // room-tone pavza → prekini (ob play se ponovi vrstica)
+      }
+      return;
+    }
+    if (introPhaseRef.current && introAudioRef.current) {
+      // nadaljuj melodijo (uvod ali izhod) od mesta pavze
+      activatePan();
+      introTimerRef.current = setTimeout(() => introDoneRef.current(), 9000);
+      void introAudioRef.current.play().catch(() => {});
+      onPlayingChange(true);
+      return;
+    }
+    if (ghostActiveRef.current && pendingGapNextRef.current !== null && gapAudioRef.current) {
+      // nadaljuj prekrivni vzklik od mesta pavze
+      activatePan(); // kontekst teče pred nadaljevanjem drugega kanala
+      void gapAudioRef.current.play().catch(() => {});
+      onPlayingChange(true);
+      return;
+    }
+    if (currentIndexRef.current === null) {
+      /*
+       * Eksplicitni zagon od začetka PORABI obnovo pozicije (race z
+       * durationsReady — glej restore efekt zgoraj): uporabnik je izbral play,
+       * zato kasnejši prihod trajanj ne sme skočiti na shranjeno pozicijo.
+       */
+      resumeDoneRef.current = true;
+      const first = nextAudioIndex(linesRef.current, 0);
+      if (first !== null) {
+        /*
+         * UVODNA MELODIJA (Task 30): pre-roll pred 1. vrstico — kot v izvozu.
+         * Ob koncu melodije se zažene obstoječa veriga (efekt naloži + predvaja
+         * vrstico); napaka/odmene → fallback takoj na vrstico.
+         */
+        startJingle('intro', () => setCurrentIndex(first));
+        onPlayingChange(true);
+      }
+      return;
+    }
+    void audio.play().catch(() => {});
+  }, [playing, cancelGap, onPlayingChange, startJingle]);
+
+  const playLine = useCallback(
+    (index: number) => {
+      const line = linesRef.current[index];
+      if (!line?.audioPath) return; // vrstice brez zvoka niso klikabilne
+      if (index === currentIndexRef.current) {
+        togglePlay();
+        return;
+      }
+      cancelGap();
+      setCurrentIndex(index);
+    },
+    [togglePlay, cancelGap],
+  );
+
+  /** Skok na vrstico iz poglavja: vedno na začetek vrstice (predvajaj ali prevrti). */
+  const jumpToLine = useCallback((index: number) => {
+    const line = linesRef.current[index];
+    if (!line?.audioPath) return;
+    if (index === currentIndexRef.current) {
+      const audio = audioRef.current;
+      if (audio) {
+        audio.currentTime = 0;
+        void audio.play().catch(() => {});
+      }
+      return;
+    }
+    cancelGap();
+    setCurrentIndex(index);
+  }, [cancelGap]);
+
+  const playNextLine = useCallback(() => {
+    const current = currentIndexRef.current;
+    const start = current === null ? 0 : current + 1;
+    const next = nextAudioIndex(linesRef.current, start);
+    if (next !== null) {
+      cancelGap();
+      setCurrentIndex(next);
+    } else if (current !== null) {
+      audioRef.current?.pause(); // konec epizode
+      finishEpisodeRef.current();
+    }
+  }, [cancelGap]);
+
+  const playPrevLine = useCallback(() => {
+    const current = currentIndexRef.current;
+    if (current === null) {
+      const first = nextAudioIndex(linesRef.current, 0);
+      if (first !== null) setCurrentIndex(first);
+      return;
+    }
+    const prev = prevAudioIndex(linesRef.current, current - 1);
+    if (prev !== null) {
+      cancelGap();
+      setCurrentIndex(prev);
+      return;
+    }
+    const audio = audioRef.current; // ni prejšnje → ponovi trenutno
+    if (audio) {
+      audio.currentTime = 0;
+      void audio.play().catch(() => {});
+    }
+  }, [cancelGap]);
+
+  // ── Iskanje po scenariju (Apple Podcasts transkript-search stil) ──
+  const searchNeedle = foldText(searchQuery.trim());
+  const searchActive = searchOpen && searchNeedle.length >= 2;
+  const searchMatches = useMemo(() => {
+    if (!searchActive) return [];
+    const out: { lineIndex: number; start: number; end: number }[] = [];
+    lines.forEach((line, lineIndex) => {
+      const hay = foldText(line.text);
+      if (hay.length !== line.text.length) return; // redki Unicode primeri — brez pozicij
+      let from = 0;
+      while (from <= hay.length - searchNeedle.length) {
+        const at = hay.indexOf(searchNeedle, from);
+        if (at < 0) break;
+        out.push({ lineIndex, start: at, end: at + searchNeedle.length });
+        from = at + searchNeedle.length;
+      }
+    });
+    return out;
+  }, [lines, searchActive, searchNeedle]);
+  const lineMatchCounts = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const match of searchMatches) {
+      map.set(match.lineIndex, (map.get(match.lineIndex) ?? 0) + 1);
+    }
+    return map;
+  }, [searchMatches]);
+
+  useEffect(() => {
+    setSearchActiveIdx(0);
+  }, [searchMatches]);
+
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery('');
+    setSearchActiveIdx(0);
+  }, []);
+
+  /** Skok na zadetek: predvajanje od vrstice + gladek scroll v vidno polje. */
+  const goToMatch = useCallback(
+    (idx: number) => {
+      if (searchMatches.length === 0) return;
+      const wrapped = ((idx % searchMatches.length) + searchMatches.length) % searchMatches.length;
+      setSearchActiveIdx(wrapped);
+      const match = searchMatches[wrapped];
+      jumpToLine(match.lineIndex);
+      rowRefs.current[match.lineIndex]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    },
+    [searchMatches, jumpToLine],
+  );
+
+
+  const changeRate = useCallback((value: number) => {
+    setRate(value);
+    if (audioRef.current) audioRef.current.playbackRate = value;
+  }, []);
+
+  /** Skok ±10 s znotraj trenutne vrstice; čez konec → naslednja vrstica. */
+  const skipSeconds = useCallback(
+    (delta: number) => {
+      const audio = audioRef.current;
+      if (!audio || currentIndexRef.current === null) return;
+      cancelGap(); // prekliči pavzo/vzklik — skok velja takoj
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
+      const target = audio.currentTime + delta;
+      if (target >= audio.duration - 0.08) {
+        playNextLine();
+        return;
+      }
+      audio.currentTime = Math.max(0, target);
+    },
+    [playNextLine, cancelGap],
+  );
+
+  const toggleMute = useCallback(() => {
+    setMuted((prev) => {
+      const next = !prev;
+      if (audioRef.current) audioRef.current.muted = next;
+      return next;
+    });
+  }, []);
+
+  // Tipkovne bližnjice: preslednica = predvajaj/ustavi, ←/→ = skok ±10 s,
+  // ↑/↓ = prejšnja/naslednja vrstica, M = utišaj, / = iskanje, ? = pomoč.
+  // Ignoriramo vnosna polja in gumba (da ne škodujemo domačemu kliku/urejanju).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName?.toLowerCase();
+      if (
+        tag === 'input' ||
+        tag === 'textarea' ||
+        tag === 'select' ||
+        el?.isContentEditable ||
+        el?.closest('button, [role="button"], [role="slider"], a[href]')
+      ) {
+        return;
+      }
+      if (e.key === ' ') {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        skipSeconds(10);
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        skipSeconds(-10);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        playNextLine();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        playPrevLine();
+      } else if (e.key === 'm' || e.key === 'M') {
+        toggleMute();
+      } else if (e.key === '/') {
+        e.preventDefault();
+        openSearch();
+      } else if (e.key === '?') {
+        setShortcutsOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [togglePlay, skipSeconds, playNextLine, playPrevLine, toggleMute, openSearch]);
+
+  // ── Ura za spanje (Pocket Casts stil) ───────────────────────────
+  // Odštevalnik teče samo med predvajanjem; ročna pavza ga ne prekliče.
+  useEffect(() => {
+    if (!playing || sleepTimer === null || sleepTimer.mode !== 'ms') return;
+    const tick = () => {
+      const timer = sleepTimerRef.current;
+      if (!timer || timer.mode !== 'ms') return;
+      const remaining = timer.deadline - Date.now();
+      if (remaining <= 0) {
+        setSleepRemainingMs(null);
+        setSleepTimer(null);
+        audioRef.current?.pause();
+        introAudioRef.current?.pause(); // tudi jingle (uvod/izhod) zamrzni
+        toast('Ura za spanje — predvajanje ustavljeno');
+        return;
+      }
+      setSleepRemainingMs(remaining);
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [playing, sleepTimer]);
+
+  const handleSetSleepTimer = useCallback((option: SleepTimerChoice) => {
+    if (option === 'off') {
+      setSleepTimer(null);
+      setSleepRemainingMs(null);
+      toast('Ura za spanje izklopljena');
+      return;
+    }
+    if (option === 'episode') {
+      setSleepTimer({ mode: 'episode' });
+      setSleepRemainingMs(null);
+      toast('Ura za spanje: pavza na koncu epizode');
+      return;
+    }
+    const minutes = Number(option);
+    const totalMs = minutes * 60000;
+    setSleepTimer({ mode: 'ms', deadline: Date.now() + totalMs, totalMs });
+    setSleepRemainingMs(totalMs);
+    toast(`Ura za spanje: pavza čez ${minutes} min`);
+  }, []);
+
+  /** Konec epizode: ponastavi pozicijo + statistiko; pri uri 'episode' še pavza + toast. */
+  const finishEpisode = useCallback(() => {
+    finishingRef.current = true;
+    lastElapsedMsRef.current = 0;
+    saveLocalPosition(episode.id, 0);
+    void updateEpisodeProgress(episode.id, 0, false);
+    /*
+     * Pozicija/karaoke se ponastavita ZDAJ (izvoz ponastavi napredek takoj po
+     * zadnji vrstici) → naslednji zagon gre čez svežo pot (z uvodno melodijo).
+     */
+    setCurrentIndex(null);
+    if (sleepTimerRef.current?.mode === 'episode') {
+      setSleepTimer(null);
+      setSleepRemainingMs(null);
+      toast('Ura za spanje — predvajanje ustavljeno');
+      return;
+    }
+    /*
+     * ZAKLJUČNA MELODIJA (Task 30) — statistika je že poravnana; ob koncu
+     * melodije se stanje predvajanja izklopi. Ura za spanje (minute) lahko
+     * melodijo med igranjem zamrzne (togglePlay) — enako kot vrstico.
+     */
+    startJingle('outro', () => onPlayingChange(false));
+    onPlayingChange(true);
+  }, [episode.id, startJingle, onPlayingChange]);
+
+  useEffect(() => {
+    finishEpisodeRef.current = finishEpisode;
+  }, [finishEpisode]);
+
+  // Ob odhodu iz studia (ali zamenjavi epizode) še zadnji flush statistike.
+  useEffect(() => {
+    return () => {
+      saveLocalPosition(episodeIdRef.current, lastElapsedMsRef.current);
+      void updateEpisodeProgress(episodeIdRef.current, lastElapsedMsRef.current, false);
+    };
+  }, []);
+
+  const retryLine = useCallback(
+    async (lineId: string) => {
+      if (retryingIds.includes(lineId)) return;
+      setRetryingIds((prev) => (prev.includes(lineId) ? prev : [...prev, lineId]));
+      try {
+        const data = await generateLineAudio(lineId);
+        setLines((prev) =>
+          prev.map((item) => (item.id === lineId ? { ...item, audioPath: data.audioPath } : item)),
+        );
+        if (data.durationMs > 0) {
+          setDurations((prev) => ({ ...prev, [lineId]: data.durationMs / 1000 }));
+        }
+        removeLineError(lineId);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Generiranje glasu ni uspelo.');
+      } finally {
+        setRetryingIds((prev) => prev.filter((id) => id !== lineId));
+      }
+    },
+    [retryingIds, removeLineError],
+  );
+
+  const hasAudio = useMemo(() => lines.some((l) => l.audioPath), [lines]);
+
+  const handleExport = useCallback(
+    async (kind: ExportKind) => {
+      if (exportingRef.current !== null) return;
+      exportingRef.current = kind;
+      setExporting(kind);
+      try {
+        switch (kind) {
+          case 'mp3j':
+            await downloadEpisodeMp3(episode.id, episode.title, true);
+            toast.success('Epizoda prenesena (MP3 z melodijo).');
+            break;
+          case 'mp3s':
+            await downloadEpisodeMp3(episode.id, episode.title, false);
+            toast.success('Epizoda prenesena (MP3, samo govor).');
+            break;
+          case 'video':
+            await downloadEpisodeVideo(episode.id, episode.title);
+            toast.success('Video MP4 prenešen.');
+            break;
+          case 'srt':
+            await downloadEpisodeSrt(episode.id, episode.title);
+            toast.success('Podnapisi preneseni (.srt).');
+            break;
+          case 'txt':
+            await downloadEpisodeTranscript(episode.id, episode.title);
+            toast.success('Transkript prenešen (.txt).');
+            break;
+          case 'chapters':
+            await downloadEpisodeChapters(episode.id, episode.title);
+            toast.success('Poglavja prenešena (.txt).');
+            break;
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Izvoz ni uspel.');
+      } finally {
+        exportingRef.current = null;
+        setExporting(null);
+        if (kind === 'video') setExportOpen(false); // dolg izvoz — zapri meni ob koncu
+      }
+    },
+    [episode.id, episode.title],
+  );
+
+  const handleCover = useCallback(async () => {
+    if (coverPending) return;
+    setCoverPending(true);
+    try {
+      // force=true, če ovitek že obstaja ("Nov ovitek" → res nov ovitek, ne keš)
+      const path = await generateCover(episode.id, Boolean(coverPath));
+      setCoverPath(path);
+      setCoverVersion((prev) => prev + 1); // razbije brskalni keš slike
+      toast.success('Ovitek ustvarjen!');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Generiranje ovitka ni uspelo.');
+    } finally {
+      setCoverPending(false);
+    }
+  }, [coverPending, coverPath, episode.id]);
+
+  const handleCopyTranscript = useCallback(async () => {
+    const text = linesRef.current.map((l) => `${l.speaker}: ${l.text}`).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      toast.success('Transkript kopiran v odložišče.');
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Kopiranje ni uspelo.');
+    }
+  }, []);
+
+  // ── Deljenje izrezkov na vrstici (Pocket Casts "Clip Sharing" stil) ──
+
+  /** Pozicija odpiralnega čipa poglavja v seznamu poglavij (0-based) ali -1. */
+  const chapterIndexOf = useCallback(
+    (chapter: string) => chapters.findIndex((chip) => chip.title === chapter),
+    [chapters],
+  );
+
+  /**
+   * Izvoz izrezka vrstice/poglavja. Klic gre direktno prek onClick — NI vezan
+   * na življenjski cikel menija (meni se lahko zapre, izvoz teče naprej).
+   * Med delovanjem se vsi elementi menija onemogočijo, aktivni dobi Loader2;
+   * ker se meni ob videu zapre, spinner kažemo tudi na Share2 sprožilcu.
+   */
+  const handleClipShare = useCallback(
+    async (line: Line, kind: ClipKind) => {
+      if (clipBusyRef.current) return;
+      const busy = { lineId: line.id, kind };
+      clipBusyRef.current = busy;
+      setClipBusy(busy);
+      try {
+        if (kind === 'mp3') {
+          await downloadLineClip(line.id, line.speaker, 'mp3');
+          toast.success('Izrezek prenešen');
+        } else if (kind === 'video') {
+          await downloadLineClip(line.id, line.speaker, 'video'); // generiranje 5–30 s
+          toast.success('Izrezek MP4 prenešen');
+        } else {
+          if (!line.chapter) return;
+          const index = chapterIndexOf(line.chapter);
+          if (index < 0) throw new Error('Poglavja ni bilo mogoče najti.');
+          if (kind === 'chapterVideo') {
+            await downloadChapterShort(episode.id, index, line.chapter); // generiranje 5–40 s
+            toast.success('Shorts MP4 prenešen');
+          } else {
+            await downloadChapterClip(episode.id, index, line.chapter);
+            toast.success('Poglavje prenešeno');
+          }
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Izvoz izrezka ni uspel.');
+      } finally {
+        clipBusyRef.current = null;
+        setClipBusy(null);
+        // MP3/poglavje držita meni odprt med generiranjem → zapri ob koncu;
+        // video meni se zapre sam ob kliku (spinner ostane na Share2).
+        if (kind !== 'video') setShareMenuLineId(null);
+      }
+    },
+    [chapterIndexOf, episode.id],
+  );
+
+  /** Citatna kartica (PNG 1080×1350) — risba na canvas v brskalniku. */
+  const handleQuoteCard = useCallback(
+    async (line: Line) => {
+      try {
+        await downloadQuoteCard({
+          text: line.text,
+          speaker: line.speaker,
+          episodeTitle: episode.title,
+        });
+        toast.success('Citatna kartica prenešena');
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Ustvarjanje kartice ni uspelo.');
+      }
+    },
+    [episode.title],
+  );
+
+  /** Kopiraj citat vrstice v odložišče (slovenski narekovaj „…“). */
+  const handleCopyQuote = useCallback(async (line: Line) => {
+    try {
+      await navigator.clipboard.writeText(`„${line.text}“ — ${line.speaker}`);
+      toast.success('Citat kopiran');
+    } catch {
+      toast.error('Kopiranje ni uspelo.');
+    }
+  }, []);
+
+  // Urejanje vrstice: klik na svinčnik ustavi predvajanje in odpre urejanje.
+  const startEditLine = useCallback((line: Line) => {
+    audioRef.current?.pause();
+    setEditingId(line.id);
+    setEditText(line.text);
+  }, []);
+
+  const cancelEdit = useCallback(() => {
+    setEditingId(null);
+    setEditText('');
+  }, []);
+
+  const saveEditLine = useCallback(
+    async (lineId: string) => {
+      if (savingLineId) return;
+      const line = linesRef.current.find((item) => item.id === lineId);
+      const text = editText.trim();
+      if (!text) {
+        toast.error('Besedilo ne sme biti prazno.');
+        return;
+      }
+      if (line && text === line.text) {
+        cancelEdit(); // ni spremembe → ni regeneracije
+        return;
+      }
+      setSavingLineId(lineId);
+      try {
+        const data = await updateLineText(lineId, text);
+        const version = (audioVersionsRef.current.get(lineId) ?? 0) + 1;
+        audioVersionsRef.current.set(lineId, version);
+        const audioPath = data.audioPath ? withCacheBust(data.audioPath, version) : null;
+        setLines((prev) =>
+          prev.map((item) => (item.id === lineId ? { ...item, text: data.text, audioPath } : item)),
+        );
+        if (data.durationMs > 0) {
+          setDurations((prev) => ({ ...prev, [lineId]: data.durationMs / 1000 }));
+        }
+        toast.success('Vrstica urejena in glas regeneriran.');
+        setEditingId(null);
+        setEditText('');
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Urejanje vrstice ni uspelo.');
+      } finally {
+        setSavingLineId(null);
+      }
+    },
+    [editText, savingLineId, cancelEdit],
+  );
+
+  // Vprašaj voditelja: pavza → API → zamenjava vrstic → skok na prvi odgovor.
+  const handleAskHosts = useCallback(
+    async (question: string): Promise<string[]> => {
+      audioRef.current?.pause();
+      const { episode: fresh, newLineIds } = await askHosts(episode.id, question);
+      setLines(fresh.lines);
+      if (newLineIds.length > 0) {
+        const firstNew = fresh.lines.findIndex((line) => line.id === newLineIds[0]);
+        if (firstNew >= 0 && fresh.lines[firstNew]?.audioPath) {
+          setCurrentIndex(firstNew); // efekt naloži in predvaja novo vrstico
+        }
+      }
+      return newLineIds;
+    },
+    [episode.id],
+  );
+
+  const coverSrc =
+    coverPath && coverVersion > 0 ? withCacheBust(coverPath, coverVersion) : coverPath;
+
+  return (
+    <>
+      <div className="mx-auto w-full max-w-5xl flex-1 px-4 py-6 md:py-8">
+        {/* Glava epizode */}
+        <Card className="border-zinc-800 bg-zinc-900/60 py-5 shadow-none">
+          <CardContent className="px-5">
+            <div className="flex items-start gap-4">
+              {coverSrc && (
+                <img
+                  src={coverSrc}
+                  alt={`Ovitek epizode ${episode.title}`}
+                  className="size-14 shrink-0 rounded-lg border border-zinc-700 object-cover"
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <h2 className="line-clamp-2 text-xl font-bold tracking-tight text-zinc-100 sm:text-2xl">
+                  {episode.title}
+                </h2>
+                <p className="mt-1 line-clamp-2 text-sm text-zinc-400">{episode.topic}</p>
+              </div>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Badge className="border-amber-500/30 bg-amber-500/10 text-amber-400">
+                {STYLE_LABELS[episode.style] ?? episode.style}
+              </Badge>
+              <Badge variant="outline" className="border-zinc-700 text-zinc-400">
+                {LANGUAGE_LABELS[episode.language] ?? episode.language}
+              </Badge>
+              {episode.sourceType !== 'topic' && (
+                <Badge
+                  asChild={Boolean(episode.sourceUrl)}
+                  variant="outline"
+                  className="border-zinc-700 text-zinc-400"
+                >
+                  {episode.sourceUrl ? (
+                    <a
+                      href={episode.sourceUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={episode.sourceUrl}
+                    >
+                      <Link2 className="size-3" aria-hidden="true" />
+                      {SOURCE_TYPE_LABELS[episode.sourceType]}
+                    </a>
+                  ) : (
+                    <span>
+                      {episode.sourceType === 'text' && (
+                        <ClipboardPaste className="size-3" aria-hidden="true" />
+                      )}
+                      {episode.sourceType === 'script' && (
+                        <FileText className="size-3" aria-hidden="true" />
+                      )}
+                      {SOURCE_TYPE_LABELS[episode.sourceType]}
+                    </span>
+                  )}
+                </Badge>
+              )}
+              <span className="text-xs text-zinc-500">
+                {totalCount} {totalCount === 1 ? 'vrstica' : 'vrstic'}
+              </span>
+            </div>
+            {episode.hosts.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {episode.hosts.map((host, i) => {
+                  const color = hostColor(i);
+                  return (
+                    <span
+                      key={`${host.name}-${i}`}
+                      className="flex items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-950/60 px-2.5 py-1 text-xs text-zinc-300"
+                    >
+                      <span className={cn('size-2 rounded-full', color.dot)} aria-hidden="true" />
+                      <span className="font-medium text-zinc-200">{host.name}</span>
+                      <span className="text-zinc-500">· {VOICES[host.voice]?.name ?? host.voice}</span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap gap-2">
+              <DropdownMenu open={exportOpen} onOpenChange={setExportOpen}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5 border-zinc-700 bg-zinc-950/60 text-zinc-300 hover:border-amber-500/40 hover:text-amber-400"
+                    aria-label="Izvoz epizode"
+                  >
+                    {exporting ? (
+                      <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Download className="size-4" aria-hidden="true" />
+                    )}
+                    <span className="hidden sm:inline">{exporting ? 'Izvažam …' : 'Izvoz'}</span>
+                    <ChevronDown className="size-3 opacity-60" aria-hidden="true" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  className="border-zinc-800 bg-zinc-900 text-zinc-100"
+                >
+                  {EXPORT_ITEMS.map(({ kind, label, hint, Icon, needsAudio }) => (
+                    <DropdownMenuItem
+                      key={kind}
+                      disabled={exporting !== null || (needsAudio && !hasAudio)}
+                      onSelect={kind === 'video' ? (e) => e.preventDefault() : undefined}
+                      onClick={() => void handleExport(kind)}
+                      title={hint}
+                      className="focus:bg-zinc-800 focus:text-amber-300"
+                    >
+                      {kind === 'video' && exporting === 'video' ? (
+                        <Loader2
+                          className="size-4 animate-spin text-amber-400"
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <Icon className="size-4" aria-hidden="true" />
+                      )}
+                      <span className="flex min-w-0 flex-col">
+                        <span>{label}</span>
+                        {hint && <span className="text-[11px] text-zinc-500">{hint}</span>}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5 border-zinc-700 bg-zinc-950/60 text-zinc-300 hover:border-amber-500/40 hover:text-amber-400"
+                onClick={() => void handleCover()}
+                disabled={coverPending}
+                aria-label={coverPath ? 'Ustvari nov ovitek' : 'Ustvari ovitek epizode'}
+              >
+                {coverPending ? (
+                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                ) : coverPath ? (
+                  <RefreshCw className="size-4" aria-hidden="true" />
+                ) : (
+                  <ImagePlus className="size-4" aria-hidden="true" />
+                )}
+                {coverPending ? 'Ustvarjam …' : coverPath ? 'Nov ovitek' : 'Ustvari ovitek'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5 border-zinc-700 bg-zinc-950/60 text-zinc-300 hover:border-amber-500/40 hover:text-amber-400"
+                onClick={() => void handleCopyTranscript()}
+                aria-label="Kopiraj transkript epizode"
+              >
+                {copied ? (
+                  <Check className="size-4 text-emerald-500" aria-hidden="true" />
+                ) : (
+                  <Copy className="size-4" aria-hidden="true" />
+                )}
+                Kopiraj transkript
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Povzetek epizode (show notes) */}
+        {episode.summary && <ShowNotesPanel summary={episode.summary} />}
+
+        {/* Poglavja (čipi nad scenarijem) */}
+        {chapters.length > 0 && (
+          <div className="mt-4">
+            <ChaptersRow chapters={chapters} activeIndex={currentIndex} onJump={jumpToLine} />
+          </div>
+        )}
+
+        {/* Napredek generiranja glasov */}
+        <AnimatePresence initial={false}>
+          {generating && (
+            <motion.div
+              key="generation"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.25 }}
+              className="overflow-hidden"
+            >
+              <div className="mt-4 flex items-center gap-3 rounded-xl border border-amber-500/25 bg-amber-500/5 p-4">
+                <Loader2 className="size-5 shrink-0 animate-spin text-amber-400" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="font-medium text-amber-200">Generiram glasove …</span>
+                    <span className="shrink-0 tabular-nums text-amber-400/90">
+                      {readyCount}/{totalCount}
+                    </span>
+                  </div>
+                  <Progress
+                    value={totalCount > 0 ? (readyCount / totalCount) * 100 : 0}
+                    aria-label="Napredek generiranja glasov"
+                    className="mt-2 h-2 bg-zinc-800 [&_[data-slot=progress-indicator]]:bg-gradient-to-r [&_[data-slot=progress-indicator]]:from-amber-500 [&_[data-slot=progress-indicator]]:to-orange-600"
+                  />
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Scenarij (karaoke seznam) */}
+        <section aria-label="Scenarij" className="mt-6">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <h3 className="text-xs font-semibold tracking-[0.2em] text-zinc-500 uppercase">
+              Scenarij
+            </h3>
+            {searchOpen ? (
+              <ScenarioSearchBar
+                query={searchQuery}
+                onQueryChange={setSearchQuery}
+                matchCount={searchMatches.length}
+                activeIndex={searchActiveIdx}
+                onNext={() => goToMatch(searchActiveIdx + 1)}
+                onPrev={() => goToMatch(searchActiveIdx - 1)}
+                onClose={closeSearch}
+                inputRef={searchInputRef}
+              />
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                  aria-label="Išči po scenariju"
+                  title="Išči po scenariju (/)"
+                  onClick={openSearch}
+                >
+                  <Search className="size-4" aria-hidden="true" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                  aria-label="Tipkovniške bližnjice"
+                  title="Bližnjice (?)"
+                  onClick={() => setShortcutsOpen(true)}
+                >
+                  <Keyboard className="size-4" aria-hidden="true" />
+                </Button>
+                <span className="text-xs tabular-nums text-zinc-500">
+                  {readyCount}/{totalCount} vrstic z glasom
+                </span>
+              </div>
+            )}
+          </div>
+          <ol className="podcast-scroll space-y-2 pr-1 md:max-h-[55vh] md:overflow-y-auto">
+            {lines.map((line, index) => {
+              const isActive = index === currentIndex;
+              const clickable = Boolean(line.audioPath);
+              const hasError = lineErrors.includes(line.id);
+              const isRetrying = retryingIds.includes(line.id);
+              const isEditing = editingId === line.id;
+              const isSaving = savingLineId === line.id;
+              const canEdit = Boolean(line.audioPath) && !hasError;
+              const color = hostColor(hostIndexOf(line.speaker));
+              return (
+                <motion.li
+                  key={line.id}
+                  layout="position"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.25, delay: Math.min(index * 0.03, 0.45) }}
+                  ref={(el) => {
+                    rowRefs.current[index] = el;
+                  }}
+                  onClick={clickable && !isEditing ? () => playLine(index) : undefined}
+                  aria-current={isActive || undefined}
+                  className={cn(
+                    'group flex gap-3 rounded-xl border p-3 transition-colors sm:p-4',
+                    isActive
+                      ? 'border-amber-500/60 bg-amber-500/10 ring-2 ring-amber-500/40'
+                      : 'border-zinc-800/80 bg-zinc-900/40',
+                    clickable && !isActive && !isEditing && 'cursor-pointer hover:border-zinc-600',
+                    dimIfNoMatch((lineMatchCounts.get(index) ?? 0) > 0, searchActive),
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'flex size-9 shrink-0 items-center justify-center rounded-full text-sm font-bold',
+                      color.avatar,
+                    )}
+                    aria-hidden="true"
+                  >
+                    {line.speaker.charAt(0).toUpperCase()}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2">
+                      <span className="text-sm font-semibold text-zinc-200">{line.speaker}</span>
+                      {line.emotion && (
+                        <span className="text-xs italic text-zinc-500">{line.emotion}</span>
+                      )}
+                    </div>
+                    {isEditing ? (
+                      <div className="mt-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+                        <Textarea
+                          autoFocus
+                          rows={2}
+                          maxLength={900}
+                          value={editText}
+                          onChange={(e) => setEditText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                              e.preventDefault();
+                              void saveEditLine(line.id);
+                            }
+                            if (e.key === 'Escape') {
+                              e.preventDefault();
+                              cancelEdit();
+                            }
+                          }}
+                          disabled={isSaving}
+                          aria-label="Uredi besedilo vrstice"
+                          className="min-h-16 resize-none border-zinc-700 bg-zinc-950/70 text-sm leading-relaxed text-zinc-100 focus-visible:border-amber-500/50 focus-visible:ring-amber-500/20"
+                        />
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            className="h-7 gap-1 rounded-md bg-gradient-to-r from-amber-500 to-orange-600 px-2.5 text-xs font-semibold text-white hover:from-amber-400 hover:to-orange-500"
+                            onClick={() => void saveEditLine(line.id)}
+                            disabled={isSaving || editText.trim().length === 0}
+                          >
+                            {isSaving ? (
+                              <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <Check className="size-3" aria-hidden="true" />
+                            )}
+                            Shrani
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 rounded-md px-2.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                            onClick={cancelEdit}
+                            disabled={isSaving}
+                          >
+                            <X className="size-3" aria-hidden="true" />
+                            Prekliči
+                          </Button>
+                          <span className="text-xs text-zinc-600">⌘/Ctrl + Enter</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-sm leading-relaxed text-zinc-300">
+                        {searchActive ? (
+                          <HighlightedText text={line.text} query={searchQuery} />
+                        ) : (
+                          line.text
+                        )}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-0.5 self-center">
+                    {canEdit && !isEditing && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-8 text-zinc-500 opacity-100 transition-opacity hover:bg-amber-500/10 hover:text-amber-300 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                        aria-label="Uredi besedilo vrstice"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          startEditLine(line);
+                        }}
+                      >
+                        <Pencil className="size-3.5" aria-hidden="true" />
+                      </Button>
+                    )}
+                    {Boolean(line.audioPath) && !isEditing && (
+                      <DropdownMenu
+                        open={shareMenuLineId === line.id}
+                        onOpenChange={(open) => setShareMenuLineId(open ? line.id : null)}
+                      >
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-8 text-zinc-500 opacity-100 transition-opacity hover:bg-zinc-800 hover:text-zinc-200 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                            aria-label="Deli vrstico"
+                            aria-expanded={shareMenuLineId === line.id}
+                            title="Deli vrstico"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {clipBusy?.lineId === line.id ? (
+                              <Loader2
+                                className="size-3.5 animate-spin text-amber-400"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Share2 className="size-3.5" aria-hidden="true" />
+                            )}
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          className="w-64 border-zinc-800 bg-zinc-900 text-zinc-100"
+                          // REACT portali bubblajo sintetične dogodke po KOMPONENTNEM drevesu
+                          // (ne po DOM): klik na element menija bi sicer dosegel onClick
+                          // vrstice (playLine) in nemoteno sprožil predvajanje.
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <DropdownMenuItem
+                            disabled={clipBusy !== null}
+                            onSelect={(e) => e.preventDefault()}
+                            onClick={() => void handleClipShare(line, 'mp3')}
+                            className="focus:bg-zinc-800 focus:text-amber-300"
+                          >
+                            {clipBusy?.lineId === line.id && clipBusy.kind === 'mp3' ? (
+                              <Loader2
+                                className="size-4 animate-spin text-amber-400"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <AudioLines className="size-4" aria-hidden="true" />
+                            )}
+                            Izrezek MP3
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={clipBusy !== null}
+                            onClick={() => void handleClipShare(line, 'video')}
+                            className="focus:bg-zinc-800 focus:text-amber-300"
+                          >
+                            {clipBusy?.lineId === line.id && clipBusy.kind === 'video' ? (
+                              <Loader2
+                                className="size-4 animate-spin text-amber-400"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Clapperboard className="size-4" aria-hidden="true" />
+                            )}
+                            <span className="flex min-w-0 flex-col">
+                              <span>Izrezek MP4 — 9:16</span>
+                              <span className="text-[11px] text-zinc-500">
+                                TikTok/Reels · generiranje 5–30 s
+                              </span>
+                            </span>
+                          </DropdownMenuItem>
+                          {line.chapter && (
+                            <DropdownMenuItem
+                              disabled={clipBusy !== null || chapterIndexOf(line.chapter) < 0}
+                              onSelect={(e) => e.preventDefault()}
+                              onClick={() => void handleClipShare(line, 'chapter')}
+                              className="focus:bg-zinc-800 focus:text-amber-300"
+                            >
+                              {clipBusy?.lineId === line.id && clipBusy.kind === 'chapter' ? (
+                                <Loader2
+                                  className="size-4 animate-spin text-amber-400"
+                                  aria-hidden="true"
+                                />
+                              ) : (
+                                <BookOpen className="size-4" aria-hidden="true" />
+                              )}
+                              <span className="flex min-w-0 flex-col">
+                                <span>Izrezek poglavja MP3</span>
+                                <span className="text-[11px] text-zinc-500">{line.chapter}</span>
+                              </span>
+                            </DropdownMenuItem>
+                          )}
+                          {line.chapter && (
+                            <DropdownMenuItem
+                              disabled={clipBusy !== null || chapterIndexOf(line.chapter) < 0}
+                              onSelect={(e) => e.preventDefault()}
+                              onClick={() => void handleClipShare(line, 'chapterVideo')}
+                              className="focus:bg-zinc-800 focus:text-amber-300"
+                            >
+                              {clipBusy?.lineId === line.id && clipBusy.kind === 'chapterVideo' ? (
+                                <Loader2
+                                  className="size-4 animate-spin text-amber-400"
+                                  aria-hidden="true"
+                                />
+                              ) : (
+                                <Clapperboard className="size-4" aria-hidden="true" />
+                              )}
+                              <span className="flex min-w-0 flex-col">
+                                <span>Shorts MP4 — podnapisi</span>
+                                <span className="text-[11px] text-zinc-500">
+                                  TikTok/Reels · {line.chapter} · generiranje 5–40 s
+                                </span>
+                              </span>
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuItem
+                            disabled={clipBusy !== null}
+                            onClick={() => void handleQuoteCard(line)}
+                            className="focus:bg-zinc-800 focus:text-amber-300"
+                          >
+                            <Quote className="size-4" aria-hidden="true" />
+                            Citatna kartica (PNG)
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={clipBusy !== null}
+                            onClick={() => void handleCopyQuote(line)}
+                            className="focus:bg-zinc-800 focus:text-amber-300"
+                          >
+                            <Copy className="size-4" aria-hidden="true" />
+                            Kopiraj besedilo
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                    {isSaving ? (
+                      <Loader2
+                        className="size-4 animate-spin text-amber-400"
+                        aria-hidden="true"
+                      />
+                    ) : hasError ? (
+                      <>
+                        <TriangleAlert className="size-4 text-red-500" aria-hidden="true" />
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-8 text-zinc-400 hover:bg-red-500/10 hover:text-red-400"
+                          aria-label="Poskusi znova"
+                          disabled={isRetrying}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void retryLine(line.id);
+                          }}
+                        >
+                          {isRetrying ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <RotateCcw className="size-3.5" />
+                          )}
+                        </Button>
+                      </>
+                    ) : line.audioPath ? (
+                      isActive ? (
+                        <Equalizer active={playing} bars={4} className="h-4" />
+                      ) : (
+                        <Check className="size-4 text-emerald-500" aria-hidden="true" />
+                      )
+                    ) : (
+                      <Loader2
+                        className="size-4 animate-spin text-zinc-600"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </div>
+                </motion.li>
+              );
+            })}
+          </ol>
+
+          {/* Vprašaj voditelja (interaktivni način) */}
+          <AskHostsCard onAsk={handleAskHosts} />
+        </section>
+      </div>
+
+      <PlayerBar
+        title={episode.title}
+        playing={playing}
+        jinglePhase={jinglePhase}
+        hasAudio={readyCount > 0}
+        elapsed={elapsed}
+        total={totalDuration}
+        rate={rate}
+        muted={muted}
+        sleepRemainingMs={sleepRemainingMs}
+        sleepMode={
+          sleepTimer === null
+            ? 'off'
+            : sleepTimer.mode === 'episode'
+              ? 'episode'
+              : (String(sleepTimer.totalMs / 60000) as SleepTimerChoice)
+        }
+        onSetSleepTimer={handleSetSleepTimer}
+        onTogglePlay={togglePlay}
+        onPrevLine={playPrevLine}
+        onNextLine={playNextLine}
+        onSkip={skipSeconds}
+        onRateChange={changeRate}
+        onToggleMute={toggleMute}
+      />
+
+      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+    </>
+  );
+}
