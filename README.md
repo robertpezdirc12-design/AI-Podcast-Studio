@@ -21,6 +21,7 @@ AI Podcast Studio je splet aplikacija, ki iz ene teme samostojno napiše dvogost
 - **Stereo pan** — Rok levo, Petra desno (prava radijska postavitev)
 - **Mikro-jitter** — rahla variacija tempa/obraza za ne-mehanični ritem
 - **Tempo-lok** — ciljna artikulacija (≈ 5,9 zlog/s) z osnovnim tempom +5 %
+- **Glasbena podlaga prelokov z duckingom** — determinističen Aadd9 pad pod poglavitnimi prelomi; `sidechaincompress` ga usede ≈15 dB pod govorom, v pavzi pa "za dihe" nazaj (radio veriga: mastering samo na govoru → glasba po masteringu na absolutni ravni)
 - **Mastering** — dvoprehodni **linearni** loudnorm (brez pumpanja), highpass 75 Hz, blagi kompresor; 24 kHz cevovod
 
 ### 📺 Karaoke predvajalnik
@@ -37,7 +38,7 @@ AI Podcast Studio je splet aplikacija, ki iz ene teme samostojno napiše dvogost
 ### 📦 Izvozi
 | Format | Pot | Vsebina |
 |---|---|---|
-| **MP3** (cela epizoda) | `/api/episodes/:id/download` | mastering + ID3v2.3 (naslov, izvajalec, **CHAP/CTOC poglavja**, **APIC ovitek**) |
+| **MP3** (cela epizoda) | `/api/episodes/:id/download` | mastering + ID3v2.3 (naslov, izvajalec, **CHAP/CTOC poglavja**, **APIC ovitek**, glasbena podlaga prelokov z duckingom) |
 | **MP3 izrezek poglavja** | `/api/episodes/:id/chapterclip?index=N` | mastered izrezek poglavja z APIC |
 | **MP4 audiogram** | `/api/episodes/:id/video` | ovitek + animirani valovni obrazec + poglavja |
 | **Shorts MP4** | `/api/episodes/:id/short?index=N` | **vertikalni 9:16 (720×1280)** z **vžganimi podnapisi, ki sledijo govoru** (ASS/libass), jantarno ime govorca ob menjavi, ovitek + val + znamka |
@@ -128,7 +129,8 @@ scripts/                        # razvojna orodja (regen audio, tempo-audit, ...
 
 ## 🗺️ Roadmap
 
-- [ ] Glasba pod govorom z duckingom (`ffmpeg sidechaincompress`)
+- [x] Glasba pod govorom z duckingom (`ffmpeg sidechaincompress`)
+- [x] Shorts MP4 z vžganimi podnapisi (9:16, ASS/libass)
 - [ ] 2–3 stili shorts podnapisov (velikost/box/animacija)
 - [ ] Tretji gost-glas (ko Edge doda nova sl-SI glasova)
 - [ ] Javna delitvena stran epizode

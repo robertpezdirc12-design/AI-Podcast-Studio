@@ -1906,7 +1906,7 @@ const EXPORT_TP = -1.5
 const EXPORT_ROOM = 'aecho=1:1:24|42:0.055|0.035' // enotni gain (suha pot ×1) — samo mokri odmevi dodani
 
 /** Dvoprehodni loudnorm + rahel room: meritev z ISTO verigo → linear normaliziraj. */
-async function masterExportMp3(rawPath: string, outPath: string): Promise<void> {
+async function masterExportMp3(rawPath: string, outPath: string, wavIntermediate = false): Promise<void> {
   const measureChain = `${EXPORT_ROOM},loudnorm=I=${EXPORT_LUFS}:TP=${EXPORT_TP}:LRA=11:print_format=json`
   let report = ''
   try {
@@ -1940,13 +1940,56 @@ async function masterExportMp3(rawPath: string, outPath: string): Promise<void> 
     '-y', '-v', 'error',
     '-i', rawPath,
     '-af', `${EXPORT_ROOM},${loudnorm},alimiter=limit=0.84:level=disabled:attack=5:release=60`,
-    '-ar', '24000', '-ac', '2', '-c:a', 'libmp3lame', '-q:a', '4',
+    '-ar', '24000', '-ac', '2',
+    // WAV vmesni izhod = glasbena mešanica sledi brez ponovnega mp3 kodiranja
+    ...(wavIntermediate ? ['-c:a', 'pcm_s16le'] : ['-c:a', 'libmp3lame', '-q:a', '4']),
     outPath,
   ])
 }
 
+/**
+ * GLASBENA MEŠANICA NA MASTERIRAN GOVOR (Task 37): podlaga = Aadd9 pad na
+ * poglavitnih prelomih, udušen z sidechaincompress (stranska veriga = govor).
+ * Vhod je že masteriran WAV (govor −19 LUFS) → absolutna raven podlage je
+ * stabilna (MUSIC_BED_LEVEL množitelj), ducking −15 dB pod govorom, v pavzi
+ * se sprosti nazaj. Izhod = končni MP3 (ena samo kodiranje).
+ */
+async function mixMusicIntoMaster(
+  masterWavPath: string,
+  outPath: string,
+  chapterStarts: ChapterMarker[],
+  musicBedPath: string,
+): Promise<void> {
+  const args: string[] = ['-y', '-v', 'error', '-i', masterWavPath]
+  const parts: string[] = []
+  const musicLabels: string[] = []
+  chapterStarts.forEach((ch, i) => {
+    args.push('-i', musicBedPath)
+    const delayMs = Math.max(0, ch.startMs - MUSIC_BED_LEAD_MS)
+    parts.push(
+      `[${i + 1}:a]pan=stereo|c0=c0|c1=c0,adelay=${delayMs}:all=1[m${i}]`,
+    )
+    musicLabels.push(`[m${i}]`)
+  })
+  const filter =
+    `${parts.join(';')};` +
+    `${musicLabels.join('')}amix=inputs=${musicLabels.length}:duration=longest:normalize=0,` +
+    `volume=${MUSIC_BED_LEVEL}[music];` +
+    `[music][0:a]${MUSIC_DUCK_FILTER}[duck];` +
+    `[0:a][duck]amix=inputs=2:duration=first:normalize=0,aresample=24000[out]`
+  args.push(
+    '-filter_complex',
+    filter,
+    '-map', '[out]',
+    '-ar', '24000', '-ac', '2', '-c:a', 'libmp3lame', '-q:a', '4',
+    outPath,
+  )
+  await execFile('ffmpeg', args, { maxBuffer: 8 * 1024 * 1024, timeout: 300_000 })
+}
+
 export function exportPathFor(episodeId: string, withJingle = false): string {
-  const suffix = withJingle ? '_j' : ''
+  // "m" = era glasbene podlage (Task 37) → samodejna invalidacija starih kešev
+  const suffix = withJingle ? '_jm' : ''
   return path.join(AUDIO_DIR, `${EXPORT_PREFIX}${episodeId}${suffix}.mp3`)
 }
 
@@ -2227,6 +2270,32 @@ export async function exportEpisodeMp3(
   }
 
   /*
+   * POGLAVITVENI PRELOMI (isti pravila kot ID3 žigi spodaj): začetek poglavja
+   * = offset odpiralne vrstice; tja gre glasbena podlaga (1,3 s prej → ~4,3 s
+   * čez prvo vrstico). Računamo PRED grafom, ker žigi in podlaga delita vir.
+   */
+  const chapterStarts: ChapterMarker[] = []
+  {
+    const seen = new Set<string>()
+    for (let i = 0; i < items.length; i += 1) {
+      const ch = (items[i].line.chapter ?? '').trim()
+      if (!ch || seen.has(ch) || offsetsMs[i] <= 0) continue
+      seen.add(ch)
+      chapterStarts.push({ title: ch, startMs: offsetsMs[i] })
+    }
+  }
+  // Glasbena podlaga — samo produkcijska varianta (z melodijo); fail-soft
+  let musicBedPath: string | null = null
+  if (withJingle && chapterStarts.length > 0) {
+    try {
+      musicBedPath = await ensureTransitionMusicBed()
+    } catch (err) {
+      console.error('[export] glasbena podlaga ni uspela, izvažam brez nje:', err)
+      musicBedPath = null
+    }
+  }
+
+  /*
    * STEREO UMESTITEV GOVORCEV (raziskava Task 27: r/podcasting — rahel pan
    * različnih govorcev je standardna praksa; Sound on Sound — amplitudni pan
    * brez zakasnitev je 100 % mono-varen, ker se faze ne premaknejo; edini
@@ -2296,8 +2365,33 @@ export async function exportEpisodeMp3(
     }
   }
 
-  // Mastering (dvoprehodni loudnorm -19 LUFS + rahel room) — glej zgoraj
-  await masterExportMp3(rawPath, outPath)
+  /*
+   * MASTERING → GLASBA → MP3 (Task 37, pomembno zaporedje!):
+   * 1) mastering (loudnorm −19 LUFS) teče SAMO na govoru — tonalna/sustajena
+   *    glasba bi dvignila LRA meritve in loudnorm spravila v dinamični način
+   *    (izmerjeno −22 LUFS namesto −19).
+   * 2) glasbena podlaga se zmeša NA masteriran govor na absolutni ravni
+   *    (sidechaincompress: govor kot stranska veriga) — raven podlage je
+   *    izrazito neodvisna od loudnorm ojačenja, ducking pa vidi DEJANSKO
+   *    končno raven govora (radio praksa: glasba vedno za masteringom).
+   * 3) ena MP3 kodiranje na koncu (brez ponovnega mp3 → mp3).
+   */
+  if (musicBedPath) {
+    const masterWav = `${outPath}.${process.pid}.master.wav`
+    try {
+      await masterExportMp3(rawPath, masterWav, true)
+      await mixMusicIntoMaster(masterWav, outPath, chapterStarts, musicBedPath)
+    } finally {
+      try {
+        fs.unlinkSync(masterWav)
+      } catch {
+        // ignore
+      }
+    }
+  } else {
+    // Mastering (dvoprehodni loudnorm -19 LUFS + rahel room) — glej zgoraj
+    await masterExportMp3(rawPath, outPath)
+  }
   try {
     fs.unlinkSync(rawPath)
   } catch {
@@ -2310,15 +2404,12 @@ export async function exportEpisodeMp3(
    * zato so vgrajena ID3 poglavja točna za OBE varianti (z/brez melodijo).
    * "Uvod" je obvezen prvi žig @ 0 (Apple standard); dodatni žigi samo za
    * NOVA imena poglavij s startom > 0 (isto poglavje čez več vrstic = en žig).
+   * chapterStarts je isti seznam, ki ga je porabila glasbena podlaga (Task 37).
    */
-  const chapterMarkers: { title: string; startMs: number }[] = [{ title: 'Uvod', startMs: 0 }]
-  const seenChapters = new Set<string>()
-  for (let i = 0; i < items.length; i += 1) {
-    const ch = (items[i].line.chapter ?? '').trim()
-    if (!ch || seenChapters.has(ch) || offsetsMs[i] <= 0) continue
-    seenChapters.add(ch)
-    chapterMarkers.push({ title: ch, startMs: offsetsMs[i] })
-  }
+  const chapterMarkers: { title: string; startMs: number }[] = [
+    { title: 'Uvod', startMs: 0 },
+    ...chapterStarts,
+  ]
   // Ovitek na disku (coverPath je javna pot "/api/cover/<dat>")
   const coverDisk = opts.coverPath
     ? path.join(COVER_DIR, path.basename(opts.coverPath))
@@ -2380,6 +2471,62 @@ const VIDEO_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
 const JINGLE_INTRO_MS = 2200 // trajanje sintetizirane uvodne melodije
 const JINGLE_OUTRO_MS = 3000 // trajanje sintetizirane zaključne melodije
 const VIDEO_CHUNK_SECONDS = 12 // delčki = majhen pomnilnik na ffmpeg klic (peskovniške omejitve)
+
+/*
+ * GLASBENA PODLAGA PRELOKOV (Task 37): determinističen Aadd9 pad (ffmpeg sine,
+ * keširan) pod poglavitnimi prelomi — vstopi 1,3 s PRED začetkom poglavja
+ * (prekrije zadnji zlog prejšnje vrstice + poglavjsno pavzo) in tihi ~4,3 s
+ * nad prvo vrstico novega poglavja. DUCKING: sidechaincompress z GOVOROM kot
+ * stransko verigo — pod govorom se usede ≈15 dB nižje (razmerje 8:1), v pavzi
+ * pa "za dihe" nazaj na polno raven (masteriran room tone je pod pragom 0,012
+ * → pavza NE sproži duckinga). Samo produkcijska varianta (z melodijo); brez
+ * poglavij / ob napaki sinteze = izvoz brez podlage (fail-soft, kot jingle).
+ */
+const MUSIC_BED_FILE = 'music_bed_transition.wav'
+const MUSIC_BED_MS = 5600 // trajanje padа (fade-in 0,5 s, fade-out 1,6 s)
+const MUSIC_BED_LEAD_MS = 1300 // vstop podlage PRED začetkom poglavja
+// Množitelj NA MASTERIRAN govor: bed RMS −32,5 dBFS → ≈ −26 dBFS sam v pavzi
+// (≈ 6 LU pod govorom); po duckingu ≈ −41 dBFS (≈ 19 LU pod govorom)
+const MUSIC_BED_LEVEL = 2.2
+const MUSIC_DUCK_FILTER =
+  'sidechaincompress=threshold=0.012:ratio=8:attack=20:release=650:makeup=1'
+
+/** Deterministična glasbena podlaga prelokov (Aadd9 pad) — keširana datoteka. */
+async function ensureTransitionMusicBed(): Promise<string> {
+  fs.mkdirSync(AUDIO_DIR, { recursive: true })
+  const outPath = path.join(AUDIO_DIR, MUSIC_BED_FILE)
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 20000) return outPath
+  const dur = (MUSIC_BED_MS / 1000).toFixed(2)
+  const fadeOutStart = ((MUSIC_BED_MS - 1600) / 1000).toFixed(2)
+  // Aadd9: A2/E3/A3/B3/C#4/E4 — odloženi vstopi ×90 ms, bas najmočnejši
+  const tones = [
+    { f: 110, d: 0, v: 0.5 },
+    { f: 164.81, d: 90, v: 0.45 },
+    { f: 220, d: 180, v: 0.42 },
+    { f: 246.94, d: 270, v: 0.35 },
+    { f: 277.18, d: 360, v: 0.38 },
+    { f: 329.63, d: 450, v: 0.3 },
+  ]
+  const args: string[] = ['-y', '-v', 'error']
+  for (const t of tones) {
+    args.push('-f', 'lavfi', '-i', `sine=frequency=${t.f}:duration=${dur}`)
+  }
+  const chain = tones
+    .map((t, i) => `[${i}:a]adelay=${t.d}:all=1,volume=${t.v}[n${i}]`)
+    .join(';')
+  const labels = tones.map((_, i) => `[n${i}]`).join('')
+  args.push(
+    '-filter_complex',
+    `${chain};${labels}amix=inputs=${tones.length}:normalize=0,` +
+      'tremolo=f=3.2:d=0.3,lowpass=f=2600,' +
+      `afade=t=in:d=0.5,afade=t=out:st=${fadeOutStart}:d=1.6,` +
+      'volume=0.38,aresample=24000[out]',
+    '-map', '[out]', '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le',
+    outPath,
+  )
+  await execFile('ffmpeg', args, { maxBuffer: 8 * 1024 * 1024, timeout: 120_000 })
+  return outPath
+}
 
 export interface ChapterMarker {
   title: string
