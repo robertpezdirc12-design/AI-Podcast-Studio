@@ -3225,11 +3225,40 @@ function splitCaptionText(text: string, maxChars = 72): string[] {
   return chunks.length > 0 ? chunks : [clean.slice(0, maxChars)]
 }
 
-/** ASS subtitls datoteka: en dogodek na vrstico (daljše → delčki), amber ime govorca ob menjavi. */
+/**
+ * PODNAPISNI STILI SHORTS (Task 38 — raziskava: Jellypod ponuja 13 stilov,
+ * OpusClip standard = belo/box/rumeno). Trije pokriti izhodiščni stili:
+ * - klasika: belo + črni obroba + jantarno ime govorca (privzeti)
+ * - okvir:   TikTok box — belo na pol-prosojnem črnem kvadru (BorderStyle=3,
+ *            box = OutlineColour, Outline = oblazinjenje)
+ * - poudarek: rumeno besedilo + debelejša obroba + senco (visok kontrast na
+ *            temnem ovitku); ime govorca BELO (rumeno na rumenem = neberljivo)
+ */
+export type ShortsCaptionStyle = 'klasika' | 'okvir' | 'poudarek'
+export const SHORTS_CAPTION_STYLES: ShortsCaptionStyle[] = ['klasika', 'okvir', 'poudarek']
+
+const SHORTS_STYLE_LINE: Record<ShortsCaptionStyle, string> = {
+  klasika:
+    'Style: Shorts,DejaVu Sans,46,&H00FFFFFF,&H000000FF,&H00141414,&H96000000,1,0,0,0,100,100,0,0,1,3,1,2,40,40,300,1',
+  okvir:
+    'Style: Shorts,DejaVu Sans,48,&H00FFFFFF,&H000000FF,&H30000000,&H30000000,1,0,0,0,100,100,0,0,3,10,0,2,40,40,300,1',
+  poudarek:
+    'Style: Shorts,DejaVu Sans,50,&H0015CCFA,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,4,2,2,40,40,300,1',
+}
+
+/** Barva imena govorca pri menjavi (ASS \c, BGR) — POZOR: v TS dvojne poševnice. */
+const SHORTS_SPEAKER_TAG: Record<ShortsCaptionStyle, string> = {
+  klasika: '\\c&H0B9EF5&',
+  okvir: '\\c&H0B9EF5&',
+  poudarek: '\\c&HFFFFFF&',
+}
+
+/** ASS subtitls datoteka: en dogodek na vrstico (daljše → delčki), ime govorca ob menjavi. */
 function buildAssCaptions(
   items: { line: GapLineInfo; file: string }[],
   offsetsMs: number[],
   dursMs: number[],
+  style: ShortsCaptionStyle = 'klasika',
 ): string {
   const header = [
     '[Script Info]',
@@ -3241,8 +3270,7 @@ function buildAssCaptions(
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    // rdečkasto-jantarno ime = #f59e0b → ASS &H000B9EF5 (BGR); bel primarni
-    'Style: Shorts,DejaVu Sans,46,&H00FFFFFF,&H000000FF,&H00141414,&H96000000,1,0,0,0,100,100,0,0,1,3,1,2,40,40,300,1',
+    SHORTS_STYLE_LINE[style],
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
@@ -3262,11 +3290,12 @@ function buildAssCaptions(
     for (const chunk of chunks) {
       const chunkMs = Math.round((chunk.length / totalChars) * dur)
       const end = cursor + chunkMs
-      // ime govorca v jantarni, ko govorec MENJA — bralcu jasno, kdo govori.
+      // ime govorca v barvi STILA (Task 38), ko govorec MENJA — jasno, kdo govori.
       // POZOR: v TS literálu \\c in \\r (enojni \r je carriage return!)
+      const speakerTag = SHORTS_SPEAKER_TAG[style]
       const prefix =
         speaker && speaker !== prevSpeaker && i > 0
-          ? `{\\c&H0B9EF5&}${assEscape(speaker)}:{\\r} `
+          ? `{${speakerTag}}${assEscape(speaker)}:{\\r} `
           : ''
       events.push(
         `Dialogue: 0,${assTime(cursor)},${assTime(end)},Shorts,,0,0,0,,${prefix}${assEscape(chunk)}`,
@@ -3377,16 +3406,18 @@ async function encodeShortsAttempt(args: {
 const shortsLocks = new Map<string, Promise<{ filePath: string; bytes: number; durationMs: number }>>()
 
 /**
- * Poglavjski SHORTS (Task 36): vertikalni MP4 9:16 s vžganimi podnapisi, ki
+ * Poglavjski SHORTS (Task 36/38): vertikalni MP4 9:16 s vžganimi podnapisi, ki
  * sledijo govoru (ASS/libass), ovitkom epizode kot podlago, animiranim valom
  * in naslovom poglavja — OpusClip/Podsqueeze "long-to-short" stil, 100 %
  * lokalno z ffmpeg. Zvok = mastered MP3 izrezek poglavja (isti timeline).
+ * `meta.style` = podnapisni stil (klasika/okvir/poudarek) — keš ključ ga nosi,
+ * zato ima vsak stil svojo datoteko.
  */
 export async function exportChapterClipMp4(
   key: string,
   lines: (GapLineInfo & { audioPath: string | null })[],
   audioMp3Path: string,
-  meta?: { title?: string; artist?: string; coverPath?: string | null },
+  meta?: { title?: string; artist?: string; coverPath?: string | null; style?: ShortsCaptionStyle },
 ): Promise<{ filePath: string; bytes: number; durationMs: number }> {
   const outPath = rangeVideoPathFor(key)
   if (fs.existsSync(outPath) && fs.statSync(outPath).size > 10000) {
@@ -3411,7 +3442,7 @@ export async function exportChapterClipMp4(
   const titlePath = path.join(AUDIO_DIR, `rangevideo_${safeKey}.${pid}.title.txt`)
   const tmpPath = path.join(AUDIO_DIR, `rangevideo_${safeKey}.${pid}.tmp.mp4`)
   try {
-    fs.writeFileSync(assPath, buildAssCaptions(items, offsetsMs, dursMs))
+    fs.writeFileSync(assPath, buildAssCaptions(items, offsetsMs, dursMs, meta?.style ?? 'klasika'))
     const title = (meta?.title ?? '').slice(0, 90)
     fs.writeFileSync(titlePath, wrapTextLines(title, 30, 3) + '\n')
     const coverDisk = meta?.coverPath
@@ -3445,7 +3476,7 @@ export function exportChapterClipMp4Locked(
   key: string,
   lines: (GapLineInfo & { audioPath: string | null })[],
   audioMp3Path: string,
-  meta?: { title?: string; artist?: string; coverPath?: string | null },
+  meta?: { title?: string; artist?: string; coverPath?: string | null; style?: ShortsCaptionStyle },
 ): Promise<{ filePath: string; bytes: number; durationMs: number }> {
   const existing = shortsLocks.get(key)
   if (existing) return existing

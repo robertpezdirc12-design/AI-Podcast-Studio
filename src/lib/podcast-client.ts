@@ -10,6 +10,7 @@ import type {
   Line,
   VoiceId,
 } from './podcast-types';
+import type { ShortsCaptionStyle } from '@/lib/podcast-ai';
 
 interface LineAudioResponse {
   id: string;
@@ -315,10 +316,12 @@ export function downloadChapterShort(
   episodeId: string,
   index: number,
   title: string,
+  style: ShortsCaptionStyle = 'klasika',
 ): Promise<void> {
+  const suffix = style === 'klasika' ? '' : `-${style}`;
   return downloadFile(
-    `/api/episodes/${encodeURIComponent(episodeId)}/short?index=${index}`,
-    `shorts-${safeFileTitle(title)}.mp4`,
+    `/api/episodes/${encodeURIComponent(episodeId)}/short?index=${index}&style=${style}`,
+    `shorts${suffix}-${safeFileTitle(title)}.mp4`,
     'Izvoz shorts ni uspel',
   );
 }

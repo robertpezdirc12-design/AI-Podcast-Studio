@@ -6,6 +6,7 @@ import {
   AudioLines,
   BookOpen,
   Captions,
+  CaptionsOff,
   Check,
   ChevronDown,
   Clapperboard,
@@ -13,6 +14,7 @@ import {
   Copy,
   Download,
   FileText,
+  Highlighter,
   ImagePlus,
   Keyboard,
   Link2,
@@ -39,6 +41,9 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Progress } from '@/components/ui/progress';
@@ -61,6 +66,7 @@ import {
   updateEpisodeProgress,
   updateLineText,
 } from '@/lib/podcast-client';
+import type { ShortsCaptionStyle } from '@/lib/podcast-ai';
 import {
   LANGUAGE_LABELS,
   SOURCE_TYPE_LABELS,
@@ -1415,7 +1421,7 @@ export function EpisodeStudio({
    * ker se meni ob videu zapre, spinner kažemo tudi na Share2 sprožilcu.
    */
   const handleClipShare = useCallback(
-    async (line: Line, kind: ClipKind) => {
+    async (line: Line, kind: ClipKind, shortStyle: ShortsCaptionStyle = 'klasika') => {
       if (clipBusyRef.current) return;
       const busy = { lineId: line.id, kind };
       clipBusyRef.current = busy;
@@ -1432,7 +1438,7 @@ export function EpisodeStudio({
           const index = chapterIndexOf(line.chapter);
           if (index < 0) throw new Error('Poglavja ni bilo mogoče najti.');
           if (kind === 'chapterVideo') {
-            await downloadChapterShort(episode.id, index, line.chapter); // generiranje 5–40 s
+            await downloadChapterShort(episode.id, index, line.chapter, shortStyle); // generiranje 5–40 s
             toast.success('Shorts MP4 prenešen');
           } else {
             await downloadChapterClip(episode.id, index, line.chapter);
@@ -2006,27 +2012,50 @@ export function EpisodeStudio({
                             </DropdownMenuItem>
                           )}
                           {line.chapter && (
-                            <DropdownMenuItem
-                              disabled={clipBusy !== null || chapterIndexOf(line.chapter) < 0}
-                              onSelect={(e) => e.preventDefault()}
-                              onClick={() => void handleClipShare(line, 'chapterVideo')}
-                              className="focus:bg-zinc-800 focus:text-amber-300"
-                            >
-                              {clipBusy?.lineId === line.id && clipBusy.kind === 'chapterVideo' ? (
-                                <Loader2
-                                  className="size-4 animate-spin text-amber-400"
-                                  aria-hidden="true"
-                                />
-                              ) : (
-                                <Clapperboard className="size-4" aria-hidden="true" />
-                              )}
-                              <span className="flex min-w-0 flex-col">
-                                <span>Shorts MP4 — podnapisi</span>
-                                <span className="text-[11px] text-zinc-500">
-                                  TikTok/Reels · {line.chapter} · generiranje 5–40 s
+                            <DropdownMenuSub>
+                              <DropdownMenuSubTrigger
+                                disabled={clipBusy !== null || chapterIndexOf(line.chapter) < 0}
+                                className="focus:bg-zinc-800 focus:text-amber-300 data-[state=open]:bg-zinc-800"
+                              >
+                                {clipBusy?.lineId === line.id && clipBusy.kind === 'chapterVideo' ? (
+                                  <Loader2
+                                    className="size-4 animate-spin text-amber-400"
+                                    aria-hidden="true"
+                                  />
+                                ) : (
+                                  <Clapperboard className="size-4" aria-hidden="true" />
+                                )}
+                                <span className="flex min-w-0 flex-col">
+                                  <span>Shorts MP4 — podnapisi</span>
+                                  <span className="text-[11px] text-zinc-500">
+                                    TikTok/Reels · {line.chapter} · 3 stili · 5–40 s
+                                  </span>
                                 </span>
-                              </span>
-                            </DropdownMenuItem>
+                              </DropdownMenuSubTrigger>
+                              <DropdownMenuSubContent className="border-zinc-700 bg-zinc-900 text-zinc-100">
+                                {(
+                                  [
+                                    { style: 'klasika', label: 'Klasika', desc: 'belo + črni obrobni', Icon: Captions },
+                                    { style: 'okvir', label: 'TikTok okvir', desc: 'belo na črnem kvadru', Icon: CaptionsOff },
+                                    { style: 'poudarek', label: 'Rumeni poudarek', desc: 'rumeno + debelejša obroba', Icon: Highlighter },
+                                  ] as const
+                                ).map(({ style, label, desc, Icon }) => (
+                                  <DropdownMenuItem
+                                    key={style}
+                                    disabled={clipBusy !== null}
+                                    onSelect={(e) => e.preventDefault()}
+                                    onClick={() => void handleClipShare(line, 'chapterVideo', style)}
+                                    className="focus:bg-zinc-800 focus:text-amber-300"
+                                  >
+                                    <Icon className="size-4" aria-hidden="true" />
+                                    <span className="flex min-w-0 flex-col">
+                                      <span>{label}</span>
+                                      <span className="text-[11px] text-zinc-500">{desc}</span>
+                                    </span>
+                                  </DropdownMenuItem>
+                                ))}
+                              </DropdownMenuSubContent>
+                            </DropdownMenuSub>
                           )}
                           <DropdownMenuItem
                             disabled={clipBusy !== null}

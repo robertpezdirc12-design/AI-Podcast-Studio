@@ -2,17 +2,20 @@ import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import { db } from '@/lib/db'
 import {
+  SHORTS_CAPTION_STYLES,
   exportChapterClipMp4Locked,
   exportChapterRangeMp3,
   speakerPanMapFor,
+  type ShortsCaptionStyle,
 } from '@/lib/podcast-ai'
 
 type Ctx = { params: Promise<{ id: string }> }
 
 /**
- * Poglavje kot SHORTS MP4 (Task 36): vertikalni 9:16 video z vžganimi
+ * Poglavje kot SHORTS MP4 (Task 36/38): vertikalni 9:16 video z vžganimi
  * podnapisi, ki sledijo govoru, ovitkom in animiranim valom — stil
- * OpusClip/Podsqueeze "long-to-short". `?index=N` — N-to poglavje.
+ * OpusClip/Podsqueeze "long-to-short". `?index=N` — N-to poglavje,
+ * `?style=` — podnapisni stil (klasika | okvir | poudarek; privzeti klasika).
  * Zvok = mastered MP3 izrezek poglavja (isti timeline → podnapisi usklajeni).
  */
 export async function GET(req: NextRequest, ctx: Ctx) {
@@ -23,6 +26,10 @@ export async function GET(req: NextRequest, ctx: Ctx) {
       indexRaw !== null && Number.isFinite(Number(indexRaw))
         ? Math.max(0, Math.round(Number(indexRaw)))
         : 0
+    const styleRaw = req.nextUrl.searchParams.get('style') ?? 'klasika'
+    const style: ShortsCaptionStyle = (SHORTS_CAPTION_STYLES as string[]).includes(styleRaw)
+      ? (styleRaw as ShortsCaptionStyle)
+      : 'klasika'
 
     const episode = await db.episode.findUnique({
       where: { id },
@@ -78,11 +85,13 @@ export async function GET(req: NextRequest, ctx: Ctx) {
       { title: clipTitle, artist, coverPath: episode.coverPath },
     )
 
-    // Video: vžgani podnapisi po ISTI časovnici kot MP3 izrezek
-    const video = await exportChapterClipMp4Locked(`${id}:${index}`, rangeLines, range.filePath, {
+    // Video: vžgani podnapisi po ISTI časovnici kot MP3 izrezek; stil je del
+    // keš ključa → vsak stil ima svojo datoteko (brez medsebojnega prepisovanja)
+    const video = await exportChapterClipMp4Locked(`${id}:${index}:${style}`, rangeLines, range.filePath, {
       title: clipTitle,
       artist,
       coverPath: episode.coverPath,
+      style,
     })
     const buffer = fs.readFileSync(video.filePath)
 
